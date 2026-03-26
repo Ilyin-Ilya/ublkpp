@@ -11,7 +11,7 @@ TEST(Raid0, SimpleRead) {
         .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs,
                      uint32_t nr_vecs, uint64_t addr) -> io_result {
             // The route should shift up by 4
-            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100000);
+            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b10000000);
             EXPECT_FALSE(ublkpp::is_retry(sub_cmd));
             EXPECT_EQ(nr_vecs, 1);
             EXPECT_EQ(iovecs->iov_len, 4 * Ki);

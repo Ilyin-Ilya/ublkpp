@@ -8,24 +8,24 @@ TEST(Raid1, ReadFailover) {
 
     EXPECT_CALL(*device_a, async_iov(_, _, _, _, _, _))
         .Times(1)
-        .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs, uint32_t,
-                     uint64_t addr) {
+        .WillOnce([&raid_device](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs,
+                                 uint32_t, uint64_t addr) {
             EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100);
             // It should also have the RETRIED bit set
             EXPECT_FALSE(ublkpp::is_retry(sub_cmd));
             EXPECT_EQ(iovecs->iov_len, 4 * Ki);
-            EXPECT_EQ(addr, (12 * Ki) + reserved_size);
+            EXPECT_EQ(addr, (12 * Ki) + raid_device.reserved_size());
             return std::unexpected(std::make_error_condition(std::errc::io_error));
         });
     EXPECT_CALL(*device_b, async_iov(_, _, _, _, _, _))
         .Times(1)
-        .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs, uint32_t,
-                     uint64_t addr) {
+        .WillOnce([&raid_device](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs,
+                                 uint32_t, uint64_t addr) {
             EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b101);
             // It should also have the RETRIED bit set
             EXPECT_TRUE(ublkpp::is_retry(sub_cmd));
             EXPECT_EQ(iovecs->iov_len, 4 * Ki);
-            EXPECT_EQ(addr, (12 * Ki) + reserved_size);
+            EXPECT_EQ(addr, (12 * Ki) + raid_device.reserved_size());
             return 1;
         });
 

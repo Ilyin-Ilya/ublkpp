@@ -5,7 +5,7 @@ target_sources(fs_disk PRIVATE
     fs_disk.cpp
 )
 target_link_libraries(fs_disk
-    sisl::sisl
+    sisl::cache
     ublksrv::ublksrv
 )
 
@@ -15,7 +15,7 @@ if(${libiscsi_FOUND})
       iscsi_disk.cpp
   )
   target_link_libraries(iscsi_disk
-      sisl::sisl
+      sisl::cache
       ublksrv::ublksrv
       libiscsi::libiscsi
   )
@@ -27,7 +27,7 @@ if (${homeblocks_FOUND})
       homeblk_disk.cpp
   )
   target_link_libraries(homeblk_disk
-      sisl::sisl
+      sisl::cache
       ublksrv::ublksrv
       homeblocks::homeblocks
   )

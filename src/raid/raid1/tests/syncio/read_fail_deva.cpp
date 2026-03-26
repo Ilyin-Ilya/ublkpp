@@ -10,8 +10,8 @@ TEST(Raid1, SyncIoReadDevAFail) {
     auto const test_off = 8 * Ki;
     auto const test_sz = 80 * Ki;
 
-    EXPECT_SYNC_OP(test_op, device_a, false, true, test_sz, test_off + ublkpp::raid1::reserved_size);
-    EXPECT_SYNC_OP(test_op, device_b, true, false, test_sz, test_off + ublkpp::raid1::reserved_size);
+    EXPECT_SYNC_OP(test_op, device_a, false, true, test_sz, test_off + raid_device.reserved_size());
+    EXPECT_SYNC_OP(test_op, device_b, true, false, test_sz, test_off + raid_device.reserved_size());
 
     auto res = raid_device.sync_io(test_op, nullptr, test_sz, test_off);
     ASSERT_TRUE(res);

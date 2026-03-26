@@ -2,12 +2,14 @@
 #include <gtest/gtest.h>
 
 #include "raid/raid1/bitmap.hpp"
+#include "raid/raid1/tests/test_raid1_common.hpp"
 
 using ublkpp::Ki;
 
 // Test the iteration through dirty pages
 TEST(Raid1, NextDirty) {
-    auto bitmap = ublkpp::raid1::Bitmap(100 * ublkpp::Gi, 32 * Ki, 4 * Ki);
+    auto superbitmap_buf = make_test_superbitmap();
+    auto bitmap = ublkpp::raid1::Bitmap(100 * ublkpp::Gi, 32 * Ki, 4 * Ki, superbitmap_buf.get());
     bitmap.dirty_region(0x4096, 512 * Ki);
     bitmap.dirty_region(0x23f1000, 16 * Ki);
     bitmap.dirty_region(0x23f8000, 64 * Ki);

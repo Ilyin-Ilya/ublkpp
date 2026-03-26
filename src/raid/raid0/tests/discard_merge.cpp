@@ -10,7 +10,7 @@ TEST(Raid0, MergedDiscard) {
         .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, uint32_t const len,
                      uint64_t const addr) {
             // Route is for Device A
-            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100000);
+            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b10000000);
             EXPECT_EQ(len, 32 * Ki);
             EXPECT_EQ(addr, (64 * Ki));
             return 1;
@@ -20,7 +20,7 @@ TEST(Raid0, MergedDiscard) {
         .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, uint32_t const len,
                      uint64_t const addr) {
             // Route is for Device B
-            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100001);
+            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b10000001);
             EXPECT_EQ(len, 36 * Ki);
             EXPECT_EQ(addr, (32 * Ki) + (4 * Ki));
             return 1;
@@ -30,7 +30,7 @@ TEST(Raid0, MergedDiscard) {
         .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, uint32_t const len,
                      uint64_t const addr) {
             // Route is for Device C
-            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100010);
+            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b10000010);
             EXPECT_EQ(len, 32 * Ki);
             EXPECT_EQ(addr, 32 * Ki);
             return 1;

@@ -27,8 +27,20 @@ jobs:
       tooling: None
     if: ${{ github.event_name != 'pull_request' }}
 
-  UblkPPDeps:
+  IOMgrDeps:
     needs: SislDeps
+    uses: eBay/iomanager/.github/workflows/build_dependencies.yml@master
+    with:
+      branch: master
+      platform: ${{ inputs.platform }}
+      build-type: ${{ inputs.build-type }}
+      malloc-impl: ${{ inputs.malloc-impl }}
+      prerelease: False
+      tooling: None
+    if: ${{ github.event_name != 'pull_request' }}
+
+  UblkPPDeps:
+    needs: IOMgrDeps
     uses: ./.github/workflows/build_dependencies.yml
     with:
       branch: ${{ github.ref }}

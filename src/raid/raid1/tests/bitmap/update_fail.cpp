@@ -12,7 +12,7 @@ TEST(Raid1, BITMAPUpdateFail) {
         auto const test_off = 8 * Ki;
         auto const test_sz = 12 * Ki;
 
-        EXPECT_SYNC_OP(test_op, device_a, false, true, test_sz, test_off + reserved_size);
+        EXPECT_SYNC_OP(test_op, device_a, false, true, test_sz, test_off + raid_device.reserved_size());
         EXPECT_CALL(*device_b, sync_iov(test_op, _, _, _))
             .Times(2)
             .WillOnce([](uint8_t, iovec* iov, uint32_t, off_t addr) -> io_result {
@@ -20,9 +20,9 @@ TEST(Raid1, BITMAPUpdateFail) {
                 EXPECT_EQ(0UL, addr);
                 return iov->iov_len;
             })
-            .WillOnce([test_sz, test_off](uint8_t, iovec* iov, uint32_t, off_t addr) -> io_result {
+            .WillOnce([test_sz, test_off, &raid_device](uint8_t, iovec* iov, uint32_t, off_t addr) -> io_result {
                 EXPECT_EQ(test_sz, iov->iov_len);
-                EXPECT_EQ(test_off + reserved_size, addr);
+                EXPECT_EQ(test_off + raid_device.reserved_size(), addr);
                 return iov->iov_len;
             });
 
@@ -35,12 +35,12 @@ TEST(Raid1, BITMAPUpdateFail) {
     EXPECT_CALL(*device_a, async_iov(_, _, _, _, _, _)).Times(0);
     EXPECT_CALL(*device_b, async_iov(UBLK_IO_OP_READ, _, _, _, _, _))
         .Times(1)
-        .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs, uint32_t,
-                     uint64_t addr) {
+        .WillOnce([&raid_device](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs,
+                                 uint32_t, uint64_t addr) {
             EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b101);
             EXPECT_FALSE(ublkpp::is_replicate(sub_cmd));
             EXPECT_EQ(iovecs->iov_len, 4 * Ki);
-            EXPECT_EQ(addr, (8 * Ki) + reserved_size);
+            EXPECT_EQ(addr, (8 * Ki) + raid_device.reserved_size());
             return 1;
         });
     auto res = raid_device.handle_rw(nullptr, &ublk_data, 0b10, nullptr, 4 * Ki, 8 * Ki);
@@ -49,9 +49,9 @@ TEST(Raid1, BITMAPUpdateFail) {
     EXPECT_EQ(1, res.value());
 
     EXPECT_CALL(*device_b, sync_iov(UBLK_IO_OP_WRITE, _, _, _))
-        .WillOnce([](uint8_t, iovec*, uint32_t, off_t addr) -> io_result {
-            EXPECT_GE(addr, ublkpp::raid1::k_page_size); // Expect write to bitmap!
-            EXPECT_LT(addr, reserved_size);              // Expect write to bitmap!
+        .WillOnce([&raid_device](uint8_t, iovec*, uint32_t, off_t addr) -> io_result {
+            EXPECT_GE(addr, ublkpp::raid1::k_page_size);  // Expect write to bitmap!
+            EXPECT_LT(addr, raid_device.reserved_size()); // Expect write to bitmap!
             return std::unexpected(std::make_error_condition(std::errc::io_error));
         });
 }

@@ -13,7 +13,7 @@ TEST(Raid1, SyncIoWriteFailB) {
         .Times(3)
         .WillOnce([test_off, test_sz](uint8_t, iovec* iov, uint32_t, off_t addr) -> io_result {
             EXPECT_EQ(test_sz, iov->iov_len);
-            EXPECT_EQ(test_off + reserved_size, addr);
+            EXPECT_EQ(test_off + raid_device.reserved_size(), addr);
             return iov->iov_len;
         })
         .WillOnce([](uint8_t, iovec* iov, uint32_t, off_t addr) -> io_result {
@@ -22,11 +22,11 @@ TEST(Raid1, SyncIoWriteFailB) {
             return iov->iov_len;
         })
         .WillOnce([](uint8_t, iovec* iov, uint32_t, off_t addr) -> io_result {
-            EXPECT_GE(addr, ublkpp::raid1::k_page_size); // Expect write to bitmap!
-            EXPECT_LT(addr, reserved_size);              // Expect write to bitmap!
+            EXPECT_GE(addr, ublkpp::raid1::k_page_size);  // Expect write to bitmap!
+            EXPECT_LT(addr, raid_device.reserved_size()); // Expect write to bitmap!
             return iov->iov_len;
         });
-    EXPECT_SYNC_OP(test_op, device_b, true, true, test_sz, test_off + reserved_size);
+    EXPECT_SYNC_OP(test_op, device_b, true, true, test_sz, test_off + raid_device.reserved_size());
 
     auto res = raid_device.sync_io(test_op, nullptr, test_sz, test_off);
     ASSERT_TRUE(res);

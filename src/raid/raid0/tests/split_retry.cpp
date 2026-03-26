@@ -10,7 +10,7 @@ TEST(Raid0, RetrySplitWritePortion) {
         .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs,
                      uint32_t nr_vecs, uint64_t addr) -> io_result {
             // Route is for Device B
-            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100001);
+            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b10000001);
             EXPECT_EQ(nr_vecs, 1);
             EXPECT_EQ(iovecs->iov_len, 28 * Ki);
             // This is the first chunk of the second device
@@ -23,7 +23,7 @@ TEST(Raid0, RetrySplitWritePortion) {
                                          std::vector< std::shared_ptr< UblkDisk > >{device_a, device_b, device_c});
 
     auto ublk_data = make_io_data(UBLK_IO_OP_WRITE);
-    auto const retried_route = ublkpp::set_flags(ublkpp::sub_cmd_t{0b100001}, ublkpp::sub_cmd_flags::RETRIED);
+    auto const retried_route = ublkpp::set_flags(ublkpp::sub_cmd_t{0b10000001}, ublkpp::sub_cmd_flags::RETRIED);
 
     // Set the address to within the second stripe (32KiB stripes)
     auto res = raid_device.handle_rw(nullptr, &ublk_data, retried_route, nullptr, 44 * Ki, 36 * Ki);

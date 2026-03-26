@@ -2,11 +2,14 @@
 #include <future>
 #include <ostream>
 #include <system_error>
+#include <vector>
 
 #include <boost/uuid/random_generator.hpp>
 #include <boost/uuid/string_generator.hpp>
 #include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
+#include <iomgr/io_environment.hpp>
+#include <iomgr/http_server.hpp>
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
 
@@ -38,7 +41,9 @@ SISL_OPTION_GROUP(
      "<GiB>"),
     (homeblks_dev, "", "homeblks_dev", "path to the device to run HomeBlocks on", cxxopts::value< std::string >(), ""),
 #endif
-    (stripe_size, "", "stripe_size", "RAID-0 Stripe Size", ::cxxopts::value< uint32_t >()->default_value("131072"), ""))
+    (stripe_size, "", "stripe_size", "RAID-0 Stripe Size", ::cxxopts::value< uint32_t >()->default_value("131072"), ""),
+    (device_id, "", "device_id", "Recover existing device", cxxopts::value< int32_t >()->default_value("-1"),
+     "<ublkid>"))
 
 #ifdef HAVE_HOMEBLOCKS
 #define HOMEBLKS_OPTIONS , homeblocks, iomgr
@@ -46,13 +51,7 @@ SISL_OPTION_GROUP(
 #define HOMEBLKS_OPTIONS
 #endif
 
-#ifdef HAVE_ISCSI
-#define ISCSI_OPTIONS , iscsi
-#else
-#define ISCSI_OPTIONS
-#endif
-
-#define ENABLED_OPTIONS logging, ublkpp_tgt, raid1, fs_disk, ublkpp_disk HOMEBLKS_OPTIONS ISCSI_OPTIONS
+#define ENABLED_OPTIONS logging, ublkpp_tgt, raid1, fs_disk, ublkpp_disk HOMEBLKS_OPTIONS
 
 SISL_OPTIONS_ENABLE(ENABLED_OPTIONS)
 
@@ -83,7 +82,7 @@ template < typename D >
 Result _run_target(boost::uuids::uuid const& vol_id, std::unique_ptr< D >&& dev) {
 
     // Wait for initialization to complete
-    auto res = ublkpp::ublkpp_tgt::run(vol_id, std::move(dev));
+    auto res = ublkpp::ublkpp_tgt::run(vol_id, std::move(dev), SISL_OPTIONS["device_id"].as< int32_t >());
     if (!res) { return std::unexpected(res.error()); }
     k_target = std::move(res.value());
     return k_target->device_path();
@@ -132,6 +131,10 @@ static std::shared_ptr< UblkPPApplication > init_homeblocks(std::string const& h
 }
 
 static auto create_hb_volume(UblkPPApplication& app, boost::uuids::uuid const& vol_uuid) {
+    auto known_vols = std::vector< homeblocks::volume_id_t >();
+    app._hb->volume_manager()->get_volume_ids(known_vols);
+    if (std::ranges::contains(known_vols, vol_uuid)) return std::error_condition();
+
     homeblocks::VolumeInfo vol_info;
     vol_info.page_size = 4 * Ki;
     vol_info.size_bytes = SISL_OPTIONS["capacity"].as< uint32_t >() * Gi;
@@ -143,7 +146,7 @@ static auto create_hb_volume(UblkPPApplication& app, boost::uuids::uuid const& v
         ->create_volume(std::move(vol_info))
         .via(&folly::InlineExecutor::instance())
         .thenValue([](auto&& e) {
-            if (e.hasError()) { return std::make_error_condition(std::errc::io_error); }
+            if (!e.has_value()) { return std::make_error_condition(std::errc::io_error); }
             return std::error_condition();
         })
         .get();
@@ -151,7 +154,8 @@ static auto create_hb_volume(UblkPPApplication& app, boost::uuids::uuid const& v
 #endif
 
 // Return a device based on the format of the input
-static std::unique_ptr< ublkpp::UblkDisk > get_driver(std::string const& resource) {
+// Optional: pass in a unique identifier for metrics tracking
+static std::unique_ptr< ublkpp::UblkDisk > get_driver(std::string const& resource, std::string const& metrics_id = "") {
 #ifdef HAVE_HOMEBLOCKS
     if (0 < SISL_OPTIONS["homeblks_dev"].count()) {
         if (0 < SISL_OPTIONS["capacity"].count()) {
@@ -170,8 +174,9 @@ static std::unique_ptr< ublkpp::UblkDisk > get_driver(std::string const& resourc
         return nullptr;
     }
 #endif
-    if (auto path = std::filesystem::path(resource); std::filesystem::exists(path))
-        return std::make_unique< ublkpp::FSDisk >(path);
+    if (auto path = std::filesystem::path(resource); std::filesystem::exists(path)) {
+        return std::make_unique< ublkpp::FSDisk >(path, metrics_id);
+    }
 #ifdef HAVE_ISCSI
     // From libiscsi.h iSCSI URLs are in the form:
     //   iscsi://[<username>[%<password>]@]<host>[:<port>]/<target-iqn>/<lun>
@@ -184,7 +189,8 @@ static std::unique_ptr< ublkpp::UblkDisk > get_driver(std::string const& resourc
 Result create_loop(boost::uuids::uuid const& id, std::string const& path) {
     auto dev = std::unique_ptr< ublkpp::UblkDisk >();
     try {
-        dev = get_driver(path);
+        auto loop_id = fmt::format("loop_{}", boost::uuids::to_string(id).substr(0, 8));
+        dev = get_driver(path, loop_id);
     } catch (std::runtime_error const& e) {}
     if (!dev) return std::unexpected(std::make_error_condition(std::errc::operation_not_permitted));
     return _run_target(id, std::move(dev));
@@ -194,9 +200,13 @@ Result create_raid0(boost::uuids::uuid const& id, std::vector< std::string > con
     auto dev = std::unique_ptr< ublkpp::Raid0Disk >();
     try {
         auto devices = std::vector< std::shared_ptr< ublkpp::UblkDisk > >();
+        auto raid_uuid = boost::uuids::to_string(id);
+
+        // Create stripe devices with RAID0 UUID for correlation
         for (auto const& disk : layout) {
-            devices.push_back(get_driver(disk));
+            devices.push_back(get_driver(disk, raid_uuid));
         }
+
         if (0 < devices.size())
             dev = std::make_unique< ublkpp::Raid0Disk >(id, SISL_OPTIONS["stripe_size"].as< uint32_t >(),
                                                         std::move(devices));
@@ -207,8 +217,14 @@ Result create_raid0(boost::uuids::uuid const& id, std::vector< std::string > con
 
 Result create_raid1(boost::uuids::uuid const& id, std::vector< std::string > const& layout) {
     auto dev = std::unique_ptr< ublkpp::Raid1Disk >();
+    auto raid_uuid = boost::uuids::to_string(id);
+
     try {
-        dev = std::make_unique< ublkpp::Raid1Disk >(id, get_driver(*layout.begin()), get_driver(*(layout.begin() + 1)));
+        // Create FSDisk devices with RAID1 UUID for correlation
+        auto dev_a = get_driver(*layout.begin(), raid_uuid);
+        auto dev_b = get_driver(*(layout.begin() + 1), raid_uuid);
+
+        dev = std::make_unique< ublkpp::Raid1Disk >(id, std::move(dev_a), std::move(dev_b), raid_uuid);
     } catch (std::runtime_error const& e) {}
     if (!dev) return std::unexpected(std::make_error_condition(std::errc::operation_not_permitted));
     return _run_target(id, std::move(dev));
@@ -221,21 +237,25 @@ Result create_raid10(boost::uuids::uuid const& id, std::vector< std::string > co
     }
 
     auto dev = std::unique_ptr< ublkpp::Raid0Disk >();
+    auto raid10_uuid_str = boost::uuids::to_string(id);
     try {
         auto devices = std::vector< std::shared_ptr< ublkpp::UblkDisk > >();
-        auto dev_a = std::unique_ptr< ublkpp::UblkDisk >();
         auto name_gen = boost::uuids::name_generator(id);
-        auto partition_cnt{0U};
-        for (auto const& mirror : layout) {
-            auto new_dev = get_driver(mirror);
-            if (!dev_a)
-                dev_a = std::move(new_dev);
-            else {
-                devices.push_back(std::make_shared< ublkpp::Raid1Disk >(
-                    name_gen(fmt::format("partition_{}", partition_cnt++)), std::move(dev_a), std::move(new_dev)));
-                dev_a = nullptr;
-            }
+
+        // Process disks in pairs to create RAID1 mirrors
+        for (size_t i = 0; i + 1 < layout.size(); i += 2) {
+            // Generate partition UUID for this RAID1 mirror
+            auto partition_uuid = name_gen(fmt::format("partition_{}", i / 2));
+            auto partition_uuid_str = boost::uuids::to_string(partition_uuid);
+
+            auto dev_a = get_driver(layout[i], partition_uuid_str);
+            auto dev_b = get_driver(layout[i + 1], partition_uuid_str);
+
+            // Create RAID1 mirror and add to devices
+            devices.push_back(std::make_shared< ublkpp::Raid1Disk >(partition_uuid, std::move(dev_a), std::move(dev_b),
+                                                                    raid10_uuid_str));
         }
+
         dev =
             std::make_unique< ublkpp::Raid0Disk >(id, SISL_OPTIONS["stripe_size"].as< uint32_t >(), std::move(devices));
     } catch (std::runtime_error const& e) {}
@@ -243,11 +263,16 @@ Result create_raid10(boost::uuids::uuid const& id, std::vector< std::string > co
     return _run_target(id, std::move(dev));
 }
 
+static void get_prometheus_metrics(const Pistache::Rest::Request&, Pistache::Http::ResponseWriter response) {
+    response.send(Pistache::Http::Code::Ok, sisl::MetricsFarm::getInstance().report(sisl::ReportFormat::kTextFormat));
+}
+
 int main(int argc, char* argv[]) {
     SISL_OPTIONS_LOAD(argc, argv, ENABLED_OPTIONS);
     sisl::logging::SetLogger(std::string(argv[0]),
                              BOOST_PP_STRINGIZE(PACKAGE_NAME), BOOST_PP_STRINGIZE(PACKAGE_VERSION));
     spdlog::set_pattern("[%D %T] [%^%l%$] [%n] [%t] %v");
+    ioenvironment.with_iomgr(iomgr::iomgr_params{.num_threads = 1}).with_http_server();
 
     signal(SIGINT, handle);
     signal(SIGTERM, handle);
@@ -269,13 +294,27 @@ int main(int argc, char* argv[]) {
     } else
         std::cout << SISL_PARSER.help({}) << std::endl;
 
-    if (!res) return -1;
+    if (res) {
 
-    exit_future.wait();
-    k_target.reset();
+        // start the metrics server
+        auto http_server_ptr = ioenvironment.get_http_server();
+        try {
+            auto routes = std::vector< iomgr::http_route >{{Pistache::Http::Method::Get, "/metrics",
+                                                            Pistache::Rest::Routes::bind(get_prometheus_metrics),
+                                                            iomgr::url_t::safe}};
+            http_server_ptr->setup_routes(routes);
+            http_server_ptr->start();
+        } catch (std::runtime_error const& e) { LOGERROR("setup routes failed, {}", e.what()) }
+
+        exit_future.wait();
+        k_target->destroy();
+        k_target.reset();
+    } else
+        s_stop_code.set_value(EIO);
 #ifdef HAVE_HOMEBLOCKS
     if (_app) _app->_hb->shutdown();
 #endif
+    iomanager.stop();
     return exit_future.get();
 }
 

@@ -10,7 +10,7 @@ TEST(Raid1, IdenticalDeviceProbing) {
     auto device_b = CREATE_DISK_B(TestParams{.capacity = Gi});
 
     auto raid_device = ublkpp::Raid1Disk(boost::uuids::string_generator()(test_uuid), device_a, device_b);
-    EXPECT_EQ(raid_device.capacity(), (Gi) - (reserved_size + (508 * Ki)));
+    EXPECT_EQ(raid_device.capacity(), (Gi)-raid_device.reserved_size()); // 504KiB is for alignment!
     EXPECT_STREQ(raid_device.id().c_str(), "RAID1");
 
     // CanDiscard and DirectIO `true` be default.

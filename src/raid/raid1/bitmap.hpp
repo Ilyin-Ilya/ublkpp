@@ -6,6 +6,7 @@
 #include <tuple>
 
 #include "ublkpp/lib/ublk_disk.hpp"
+#include "super_bitmap.hpp"
 
 namespace ublkpp::raid1 {
 
@@ -13,9 +14,35 @@ static_assert(sizeof(uint64_t) == sizeof(std::atomic_uint64_t), "BITMAP Cannot b
 class Bitmap {
 public:
     using word_t = std::atomic_uint64_t;
-    using map_type_t = std::map< uint32_t, std::shared_ptr< word_t > >;
+
+    struct PageData {
+        std::shared_ptr< word_t > page;
+        std::atomic< bool > loaded_from_disk;  // true = loaded unchanged, false = modified/new
+
+        PageData(std::shared_ptr< word_t > p, bool from_disk) : page(std::move(p)), loaded_from_disk(from_disk) {}
+
+        // Move constructor - needed because std::atomic is not movable
+        PageData(PageData&& other) noexcept
+            : page(std::move(other.page)), loaded_from_disk(other.loaded_from_disk.load(std::memory_order_relaxed)) {}
+
+        // Move assignment
+        PageData& operator=(PageData&& other) noexcept {
+            if (this != &other) {
+                page = std::move(other.page);
+                loaded_from_disk.store(other.loaded_from_disk.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            }
+            return *this;
+        }
+
+        // Delete copy constructor and assignment (std::atomic is not copyable)
+        PageData(const PageData&) = delete;
+        PageData& operator=(const PageData&) = delete;
+    };
+
+    using map_type_t = std::map< uint32_t, PageData >;
 
 private:
+    std::string const _id;
     uint64_t _data_size;
     uint32_t _chunk_size;
     uint32_t _align;
@@ -25,11 +52,14 @@ private:
     uint32_t const _page_width; // Number of bytes represented by a single page (block)
     size_t const _num_pages;
     std::atomic_uint64_t _dirty_chunks_est{0};
+    SuperBitmap _super_bitmap;
 
-    word_t* __get_page(uint64_t offset, bool creat = false);
+private:
+    PageData* __get_page(uint64_t offset, bool creat = false);
+    static size_t max_pages_per_tx(const UblkDisk& device);
 
 public:
-    Bitmap(uint64_t data_size, uint32_t chunk_size, uint32_t align);
+    Bitmap(uint64_t data_size, uint32_t chunk_size, uint32_t align, uint8_t* superbitmap_reserved, std::string const& id = "");
 
     static uint64_t page_size();
     size_t dirty_pages();

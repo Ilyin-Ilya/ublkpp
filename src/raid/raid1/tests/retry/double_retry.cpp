@@ -48,9 +48,9 @@ TEST(Raid1, WriteDoubleFailure) {
 
     // expect attempt to flush bitmap
     EXPECT_CALL(*device_a, sync_iov(UBLK_IO_OP_WRITE, _, _, _))
-        .WillOnce([](uint8_t, iovec*, uint32_t, off_t addr) -> io_result {
-            EXPECT_GE(addr, ublkpp::raid1::k_page_size); // Expect write to bitmap!
-            EXPECT_LT(addr, reserved_size);              // Expect write to bitmap!
+        .WillOnce([&raid_device](uint8_t, iovec*, uint32_t, off_t addr) -> io_result {
+            EXPECT_GE(addr, ublkpp::raid1::k_page_size);  // Expect write to bitmap!
+            EXPECT_LT(addr, raid_device.reserved_size()); // Expect write to bitmap!
             return std::unexpected(std::make_error_condition(std::errc::io_error));
         });
 }

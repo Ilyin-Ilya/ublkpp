@@ -4,6 +4,7 @@
 .clangd
 
 # Settings generated files and build files
+compile_commands.json
 build/*
 test_package/build*
 

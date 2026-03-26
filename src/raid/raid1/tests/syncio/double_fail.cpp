@@ -11,7 +11,7 @@ TEST(Raid1, SyncIoWriteFailBoth) {
     auto const test_off = 8 * Ki;
     auto const test_sz = 12 * Ki;
 
-    EXPECT_SYNC_OP(test_op, device_a, false, true, test_sz, test_off + reserved_size);
+    EXPECT_SYNC_OP(test_op, device_a, false, true, test_sz, test_off + raid_device.reserved_size());
     EXPECT_CALL(*device_b, sync_iov(UBLK_IO_OP_WRITE, _, _, _))
         .Times(3)
         .WillOnce([](uint8_t, iovec* iov, uint32_t, off_t addr) -> io_result {
@@ -20,13 +20,13 @@ TEST(Raid1, SyncIoWriteFailBoth) {
             return iov->iov_len;
         })
         .WillOnce([](uint8_t, iovec* iov, uint32_t, off_t addr) -> io_result {
-            EXPECT_GE(addr, ublkpp::raid1::k_page_size); // Expect write to bitmap!
-            EXPECT_LT(addr, reserved_size);              // Expect write to bitmap!
+            EXPECT_GE(addr, ublkpp::raid1::k_page_size);  // Expect write to bitmap!
+            EXPECT_LT(addr, raid_device.reserved_size()); // Expect write to bitmap!
             return iov->iov_len;
         })
         .WillOnce([test_off, test_sz](uint8_t, iovec* iov, uint32_t, off_t addr) -> io_result {
             EXPECT_EQ(test_sz, iov->iov_len);
-            EXPECT_EQ(test_off + reserved_size, addr);
+            EXPECT_EQ(test_off + raid_device.reserved_size(), addr);
             return std::unexpected(std::make_error_condition(std::errc::io_error));
         });
 

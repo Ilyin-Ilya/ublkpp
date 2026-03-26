@@ -50,6 +50,6 @@ constexpr auto _route_mask = (1U << _route_width) - 1U;
 inline sub_cmd_t shift_route(sub_cmd_t sub_cmd, sub_cmd_t const shift) { return (_route_mask & sub_cmd) << shift; }
 
 inline auto to_string(sub_cmd_t const& sub_cmd) {
-    return fmt::format("{{{:02x}:{:08b}}}", sub_cmd >> _route_width, (sub_cmd & _route_mask));
+    return fmt::format("{{{:#02x}:{:08b}}}", sub_cmd >> _route_width, (sub_cmd & _route_mask));
 }
 } // namespace ublkpp

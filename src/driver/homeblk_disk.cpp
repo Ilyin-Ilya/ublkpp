@@ -64,7 +64,7 @@ void HomeBlkDisk::collect_async(ublksrv_queue const*, std::list< async_result >&
 io_result HomeBlkDisk::handle_discard(ublksrv_queue const*, ublk_io_data const* data, sub_cmd_t sub_cmd, uint32_t len,
                                       uint64_t addr) {
     // TODO Implement discard
-    DLOGD("DISCARD [vol_id:{}]: [tag:{:0x}] ublk io [sector:{}|len:{}|sub_cmd:{}]", boost::uuids::to_string(_vol_id),
+    DLOGD("DISCARD [vol_id:{}]: [tag:{:#0x}] ublk io [sector:{}|len:{}|sub_cmd:{}]", boost::uuids::to_string(_vol_id),
           data->tag, addr >> SECTOR_SHIFT, len, ublkpp::to_string(sub_cmd))
     return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
 }
@@ -77,7 +77,7 @@ io_result HomeBlkDisk::async_iov(ublksrv_queue const* q, ublk_io_data const* dat
     auto const op = ublksrv_get_op(data->iod);
     auto const nr_lbas = __iovec_len(iovecs, iovecs + nr_vecs) >> params()->basic.logical_bs_shift;
     addr = addr >> params()->basic.logical_bs_shift;
-    DLOGT("{} [vol_id:{}] : [tag:{:0x}] ublk io [lba:{}|nr_lbas:{}|sub_cmd:{}]",
+    DLOGT("{} [vol_id:{}] : [tag:{:#0x}] ublk io [lba:{}|nr_lbas:{}|sub_cmd:{}]",
           op == UBLK_IO_OP_READ ? "READ" : "WRITE", boost::uuids::to_string(_vol_id), data->tag, addr, nr_lbas,
           ublkpp::to_string(sub_cmd))
 
@@ -85,12 +85,12 @@ io_result HomeBlkDisk::async_iov(ublksrv_queue const* q, ublk_io_data const* dat
 
     ((UBLK_IO_OP_READ == op) ? _hb_vol_if->read(_hb_volume, new_request) : _hb_vol_if->write(_hb_volume, new_request))
         .thenValue([this, new_request, q, data, sub_cmd, nr_lbas, addr](auto&& e) mutable {
-            DLOGT("I/O complete [vol_id:{}] : [tag:{:0x}] ublk io [lba:{}|nr_lbas:{}|sub_cmd:{}]",
+            DLOGT("I/O complete [vol_id:{}] : [tag:{:#0x}] ublk io [lba:{}|nr_lbas:{}|sub_cmd:{}]",
                   boost::uuids::to_string(_vol_id), data->tag, addr, nr_lbas, ublkpp::to_string(sub_cmd));
             {
                 auto lck = std::scoped_lock< std::mutex >(pending_results_lck);
                 pending_results.emplace_back(async_result{
-                    data, sub_cmd, (e.hasError() ? -EIO : (int)nr_lbas << params()->basic.logical_bs_shift)});
+                    data, sub_cmd, (!e.has_value() ? -EIO : (int)nr_lbas << params()->basic.logical_bs_shift)});
             }
             ublksrv_queue_send_event(q);
             new_request.reset();

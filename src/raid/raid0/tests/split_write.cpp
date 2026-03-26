@@ -12,7 +12,7 @@ TEST(Raid0, SplitWrite) {
         .WillOnce([fake_buffer](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs,
                                 uint32_t nr_vecs, uint64_t addr) -> io_result {
             // Route is for Device B
-            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100000);
+            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b10000000);
             EXPECT_EQ(nr_vecs, 1);
             EXPECT_EQ(iovecs->iov_len, 32 * Ki);
             EXPECT_EQ((uint8_t*)iovecs->iov_base, (uint8_t*)fake_buffer + (60 * Ki));
@@ -24,7 +24,7 @@ TEST(Raid0, SplitWrite) {
         .WillOnce([fake_buffer](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs,
                                 uint32_t nr_vecs, uint64_t addr) -> io_result {
             // Route is for Device B
-            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100001);
+            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b10000001);
             EXPECT_EQ(nr_vecs, 2);
             EXPECT_EQ(ublkpp::__iovec_len(iovecs, iovecs + nr_vecs), 32 * Ki);
             EXPECT_EQ((uint8_t*)iovecs->iov_base, (uint8_t*)fake_buffer);
@@ -38,7 +38,7 @@ TEST(Raid0, SplitWrite) {
         .WillOnce([fake_buffer](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs,
                                 uint32_t nr_vecs, uint64_t addr) -> io_result {
             // Route is for Device B
-            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100010);
+            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b10000010);
             EXPECT_EQ(nr_vecs, 1);
             EXPECT_EQ(iovecs->iov_len, 32 * Ki);
             EXPECT_EQ((uint8_t*)iovecs->iov_base, (uint8_t*)fake_buffer + (28 * Ki));

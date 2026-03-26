@@ -31,7 +31,7 @@ load_superblock(UblkDisk& device, boost::uuids::uuid const& uuid, uint32_t& stri
 
 Raid0Disk::Raid0Disk(boost::uuids::uuid const& uuid, uint32_t const stripe_size_bytes,
                      std::vector< std::shared_ptr< UblkDisk > >&& disks) :
-        UblkDisk(), _stripe_size(stripe_size_bytes) {
+        UblkDisk(), _stripe_size(stripe_size_bytes), _stride_width(_stripe_size * disks.size()) {
     // Discover overall Device parameters
     auto& our_params = *params();
     our_params.types |= UBLK_PARAM_TYPE_DISCARD;
@@ -39,14 +39,14 @@ Raid0Disk::Raid0Disk(boost::uuids::uuid const& uuid, uint32_t const stripe_size_
     direct_io = true;
 
     auto alt_stripe = false;
+    our_params.basic.physical_bs_shift = ilog2(stripe_size_bytes);
+    our_params.basic.io_opt_shift = ilog2(_stride_width);
     for (auto&& device : disks) {
         auto const& dev_params = *device->params();
         // We'll use dev_sectors to track the smallest array device we have
         our_params.basic.dev_sectors = std::min(our_params.basic.dev_sectors, dev_params.basic.dev_sectors);
         our_params.basic.logical_bs_shift =
             std::max(our_params.basic.logical_bs_shift, dev_params.basic.logical_bs_shift);
-        our_params.basic.physical_bs_shift =
-            std::max(our_params.basic.physical_bs_shift, dev_params.basic.physical_bs_shift);
         our_params.basic.max_sectors = std::min(our_params.basic.max_sectors,
                                                 static_cast< uint32_t >(dev_params.basic.max_sectors * disks.size()));
 
@@ -67,13 +67,10 @@ Raid0Disk::Raid0Disk(boost::uuids::uuid const& uuid, uint32_t const stripe_size_
         if (!sb) throw std::runtime_error(fmt::format("Could not read superblock! {}", sb.error().message()));
         _stripe_array.emplace_back(std::make_unique< StripeDevice >(std::move(device), sb.value()));
     }
-    _stride_width = _stripe_size * disks.size();
 
     // Finally we'll calculate the volume size as a multiple of the smallest array device
     // and adjust to account for the superblock we will write at the HEAD of each array device.
     // To keep things simple, we'll just use the first chunk from each device for ourselves.
-    RLOGD("RAID-0 : reserving {} blocks for SuperBlock",
-          (_stripe_size * _stripe_array.size()) >> our_params.basic.logical_bs_shift)
     our_params.basic.dev_sectors -= (_stripe_size >> SECTOR_SHIFT);
     our_params.basic.dev_sectors *= _stripe_array.size();
     // Align size to max_sector size
@@ -147,6 +144,8 @@ io_result Raid0Disk::handle_discard(ublksrv_queue const* q, ublk_io_data const* 
     bool const retry{is_retry(sub_cmd)};
     if (!retry) sub_cmd = shift_route(sub_cmd, route_size());
 
+    auto const route_mask = _max_stripe_cnt - 1;
+
     // Adjust the address for our superblock area, do not use _addr_ beyond this.
     auto const lba = addr >> params()->basic.logical_bs_shift;
     addr += _stride_width;
@@ -155,13 +154,13 @@ io_result Raid0Disk::handle_discard(ublksrv_queue const* q, ublk_io_data const* 
     for (auto const& [stripe_off, region] : raid0::merged_subcmds(_stride_width, _stripe_size, addr, len)) {
         auto const& [logical_off, logical_len] = region;
         auto const& device = _stripe_array[stripe_off]->disk;
-        if (retry && (stripe_off != ((sub_cmd >> device->route_size()) & 0x0Fu))) [[unlikely]]
+        if (retry && (stripe_off != ((sub_cmd >> device->route_size()) & route_mask))) [[unlikely]]
             continue;
         sub_cmd_t const new_sub_cmd = sub_cmd + (!retry ? stripe_off : 0);
         auto const logical_lba = logical_off >> params()->basic.logical_bs_shift;
 
-        RLOGD("Received DISCARD: [tag:{:0x}] ublk io [lba:{:0x}|len:{:0x}] -> "
-              "[stripe_off:{}|logical_lba:{:0x}|logical_len:{:0x}|sub_cmd:{}]",
+        RLOGD("Received DISCARD: [tag:{:#0x}] ublk io [lba:{:#0x}|len:{:#0x}] -> "
+              "[stripe_off:{}|logical_lba:{:#0x}|logical_len:{:#0x}|sub_cmd:{}]",
               data->tag, lba, len, stripe_off, logical_lba, logical_len, ublkpp::to_string(new_sub_cmd))
         auto res = device->handle_discard(q, data, new_sub_cmd, logical_len, logical_off);
         if (!res) return res;
@@ -183,6 +182,8 @@ io_result Raid0Disk::__distribute(iovec* iovecs, uint64_t addr, auto&& func, boo
     // Special case for single device
     if (1 == _stripe_array.size()) return func(0, sub_cmd, iovecs, 1, addr);
 
+    auto const route_mask = _max_stripe_cnt - 1;
+
     DEBUG_ASSERT_LE(iovecs->iov_len, UINT32_MAX) // LCOV_EXCL_LINE
     auto const len = (uint32_t)iovecs->iov_len;
     uint32_t cnt{0};
@@ -201,7 +202,7 @@ io_result Raid0Disk::__distribute(iovec* iovecs, uint64_t addr, auto&& func, boo
         if (retry) [[unlikely]] {
             // Mask off to get "our" portion of the original route and see if the device that processed this
             // operation matches the current RAID-0 sub-operation; if not then skip.
-            if (stripe_off != ((sub_cmd >> device->route_size()) & 0x0Fu)) continue;
+            if (stripe_off != ((sub_cmd >> device->route_size()) & route_mask)) continue;
         }
 
         auto& [io_addr, alive_cmds, io_array] = sub_cmds[stripe_off];
@@ -235,7 +236,7 @@ io_result Raid0Disk::async_iov(ublksrv_queue const* q, ublk_io_data const* data,
     bool const retry{is_retry(sub_cmd)};
     if (!retry) sub_cmd = shift_route(sub_cmd, route_size());
     auto const lba = addr >> params()->basic.logical_bs_shift;
-    RLOGT("Received {}: [tag:{:0x}] ublk io [lba:{:0x}|len:{:0x}] [sub_cmd:{}]",
+    RLOGT("Received {}: [tag:{:#0x}] ublk io [lba:{:#0x}|len:{:#0x}] [sub_cmd:{}]",
           ublksrv_get_op(data->iod) == UBLK_IO_OP_READ ? "READ" : "WRITE", data->tag, lba, iovecs->iov_len,
           ublkpp::to_string(sub_cmd))
 
@@ -247,8 +248,8 @@ io_result Raid0Disk::async_iov(ublksrv_queue const* q, ublk_io_data const* data,
         [q, data, this](uint32_t stripe_off, sub_cmd_t new_sub_cmd, iovec* iov, uint32_t nr_iovs,
                         uint64_t logical_off) {
             auto const logical_lba = logical_off >> params()->basic.logical_bs_shift;
-            RLOGT("Perform {}: [tag:{:0x}] ublk aysnc_io -> "
-                  "[stripe_off:{}|logical_lba:{:0x}|logical_len:{:0x}|sub_cmd:{}]",
+            RLOGT("Perform {}: [tag:{:#0x}] ublk aysnc_io -> "
+                  "[stripe_off:{}|logical_lba:{:#0x}|logical_len:{:#0x}|sub_cmd:{}]",
                   ublksrv_get_op(data->iod) == UBLK_IO_OP_READ ? "READ" : "WRITE", data->tag, stripe_off, logical_lba,
                   __iovec_len(iov, iov + nr_iovs), ublkpp::to_string(new_sub_cmd))
             return _stripe_array[stripe_off]->disk->async_iov(q, data, new_sub_cmd, iov, nr_iovs, logical_off);
@@ -266,7 +267,7 @@ io_result Raid0Disk::sync_iov(uint8_t op, iovec* iovecs, uint32_t nr_vecs, off_t
     return __distribute(iovecs, addr,
                         [op, this](uint32_t stripe_off, sub_cmd_t, iovec* iov, uint32_t nr_iovs, uint64_t logical_off) {
                             RLOGT("Perform {}: ublk sync_io -> "
-                                  "[stripe_off:{}|logical_sector:{}|logical_len:{:0x}]",
+                                  "[stripe_off:{}|logical_sector:{}|logical_len:{:#0x}]",
                                   op == UBLK_IO_OP_READ ? "READ" : "WRITE", stripe_off, logical_off >> SECTOR_SHIFT,
                                   __iovec_len(iov, iov + nr_iovs))
                             return _stripe_array[stripe_off]->disk->sync_iov(op, iov, nr_iovs, logical_off);
@@ -301,8 +302,8 @@ static raid0::SuperBlock* read_superblock(UblkDisk& device) {
 static io_result write_superblock(UblkDisk& device, raid0::SuperBlock* sb) {
     auto const sb_size = sizeof(raid0::SuperBlock);
     RLOGT("Writing Superblock to: [{}]", device)
-    DEBUG_ASSERT_EQ(0, sb_size % device.block_size(), "Device [{}] blocksize does not support alignment of [{}B]",
-                    device, sb_size)
+    DEBUG_ASSERT_EQ(0, sb_size % device.block_size(), "Device {} blocksize does not support alignment of [{}B]", device,
+                    sb_size)
     auto iov = iovec{.iov_base = sb, .iov_len = sb_size};
     auto res = device.sync_iov(UBLK_IO_OP_WRITE, &iov, 1, 0UL);
     if (!res) RLOGE("Error writing Superblock to: [{}]!", device, res.error().message())
@@ -318,7 +319,7 @@ load_superblock(UblkDisk& device, boost::uuids::uuid const& uuid, uint32_t& stri
 
     // Check for MAGIC, initialize SB if missing
     if (memcmp(sb->header.magic, magic_bytes, sizeof(magic_bytes))) {
-        RLOGI("Initializing RAID-0 on [{}] [stripe_size:{}KiB, vol:{}]", device, stripe_size / Ki, to_string(uuid))
+        RLOGI("Initializing RAID-0 on {} [stripe_size:{}KiB, uuid:{}]", device, stripe_size / Ki, to_string(uuid))
         memset(sb, 0x00, sizeof(raid0::SuperBlock));
         memcpy(sb->header.magic, magic_bytes, sizeof(magic_bytes));
         memcpy(sb->header.uuid, uuid.data, sizeof(sb->header.uuid));
@@ -342,15 +343,17 @@ load_superblock(UblkDisk& device, boost::uuids::uuid const& uuid, uint32_t& stri
     }
     auto const read_stripe_size = be32toh(sb->fields.stripe_size);
     if (stripe_size != read_stripe_size) {
-        RLOGW("Superblock does not match given array parameters: Expected [stripe_sz:{:0x}] != Found [stripe_sz:{:0x}]",
-              stripe_size, read_stripe_size)
+        RLOGW(
+            "Superblock does not match given array parameters: Expected [stripe_sz:{:#0x}] != Found [stripe_sz:{:#0x}]",
+            stripe_size, read_stripe_size)
         stripe_size = read_stripe_size;
     }
-    RLOGD("{} has v{:0x} superblock [stripe_sz:{:0x},stripe_off:{}]", device, be16toh(sb->header.version), stripe_size,
-          stripe_off)
+    auto const sb_ver = be16toh(sb->header.version);
+    RLOGI("Loaded v{:#0x} superblock [stripe_sz:{}Ki, stripe_off:{}, uuid:{}] from: {}", sb_ver, stripe_size / Ki,
+          stripe_off, to_string(uuid), device)
 
     // Migrating to latest version
-    if (SB_VERSION > be16toh(sb->header.version)) {
+    if (SB_VERSION > sb_ver) {
         sb->header.version = htobe16(SB_VERSION);
         if (!write_superblock(device, sb)) {
             free(sb);
@@ -358,6 +361,23 @@ load_superblock(UblkDisk& device, boost::uuids::uuid const& uuid, uint32_t& stri
         }
     }
     return sb;
+}
+
+void Raid0Disk::on_io_complete(ublk_io_data const* data, sub_cmd_t sub_cmd) {
+    // First, let the underlying device handle its portion of the routing
+    // We need to determine which stripe handled this I/O by extracting our routing bits
+    // from sub_cmd, accounting for the underlying device's routing bits.
+    auto const route_mask = _max_stripe_cnt - 1;
+
+    // Extract stripe index from sub_cmd (shift past underlying device's route bits)
+    auto const stripe_idx = static_cast< size_t >((sub_cmd >> _stripe_array[0]->disk->route_size()) & route_mask);
+
+    RLOGT("Raid0Disk::on_io_complete [tag:{:#0x}] [sub_cmd:{}] stripe_idx:{}", data->tag, ublkpp::to_string(sub_cmd), stripe_idx)
+
+    // Pass completion notification to the underlying device for its metrics
+    if (stripe_idx < _stripe_array.size()) {
+        _stripe_array[stripe_idx]->disk->on_io_complete(data, sub_cmd);
+    }
 }
 
 } // namespace ublkpp

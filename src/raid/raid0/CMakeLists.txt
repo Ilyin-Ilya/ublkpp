@@ -5,7 +5,7 @@ target_sources(raid0 PRIVATE
     raid0.cpp
 )
 target_link_libraries(raid0
-    sisl::sisl
+    sisl::cache
     ublksrv::ublksrv
 )
 

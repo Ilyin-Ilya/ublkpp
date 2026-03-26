@@ -37,6 +37,7 @@ public:
     // Constant parameters for device
     // ================
     virtual uint32_t block_size() const;
+    virtual uint32_t max_tx() const;
     virtual bool can_discard() const;
     virtual uint64_t capacity() const;
     // ================
@@ -64,6 +65,9 @@ public:
     virtual void collect_async(ublksrv_queue const*, std::list< async_result >&) {}
 
     virtual void idle_transition(ublksrv_queue const*, bool) {};
+
+    // Called when an I/O completes - allows devices to track their own metrics
+    virtual void on_io_complete(ublk_io_data const*, sub_cmd_t) {}
 
     virtual io_result handle_internal(ublksrv_queue const* q, ublk_io_data const* data, sub_cmd_t sub_cmd,
                                       iovec* iovecs, uint32_t nr_vecs, uint64_t addr, int res);

@@ -9,21 +9,21 @@ TEST(Raid0, SimpleFlush) {
         .Times(1)
         .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd) {
             // Route is for Device B
-            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100000);
+            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b10000000);
             return 1;
         });
     EXPECT_CALL(*device_b, handle_flush(_, _, _))
         .Times(1)
         .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd) {
             // Route is for Device B
-            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100001);
+            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b10000001);
             return 1;
         });
     EXPECT_CALL(*device_c, handle_flush(_, _, _))
         .Times(1)
         .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd) {
             // Route is for Device B
-            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100010);
+            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b10000010);
             return 1;
         });
 

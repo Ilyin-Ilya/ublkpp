@@ -11,7 +11,7 @@ TEST(Raid1, SimpleSyncIo) {
     auto test_sz = 12 * Ki;
 
     // Reads will only go to device_a at start
-    EXPECT_SYNC_OP(test_op, device_a, false, false, test_sz, test_off + reserved_size);
+    EXPECT_SYNC_OP(test_op, device_a, false, false, test_sz, test_off + raid_device.reserved_size());
 
     auto res = raid_device.sync_io(test_op, nullptr, test_sz, test_off);
     ASSERT_TRUE(res);
@@ -21,8 +21,8 @@ TEST(Raid1, SimpleSyncIo) {
     test_off = 1024 * Ki;
     test_sz = 16 * Ki;
 
-    EXPECT_SYNC_OP(test_op, device_a, false, false, test_sz, test_off + reserved_size);
-    EXPECT_SYNC_OP(test_op, device_b, true, false, test_sz, test_off + reserved_size);
+    EXPECT_SYNC_OP(test_op, device_a, false, false, test_sz, test_off + raid_device.reserved_size());
+    EXPECT_SYNC_OP(test_op, device_b, true, false, test_sz, test_off + raid_device.reserved_size());
 
     res = raid_device.sync_io(test_op, nullptr, test_sz, test_off);
     ASSERT_TRUE(res);

@@ -7,13 +7,14 @@ namespace ublkpp {
 
 struct StripeDevice;
 
-constexpr uint32_t _max_stripe_cnt{16};
+constexpr uint32_t _max_stripe_cnt{64};
 
 class Raid0Disk : public UblkDisk {
     std::vector< std::unique_ptr< StripeDevice > > _stripe_array;
 
     uint32_t _stripe_size{0};
     uint32_t _stride_width{0};
+
 
     io_result __distribute(iovec* iov, uint64_t addr, auto&& func, bool retry = false, sub_cmd_t sub_cmd = 0) const;
 
@@ -47,6 +48,8 @@ public:
                         uint32_t nr_vecs, uint64_t addr) override;
 
     io_result sync_iov(uint8_t op, iovec* iovecs, uint32_t nr_vecs, off_t offset) noexcept override;
+
+    void on_io_complete(ublk_io_data const* data, sub_cmd_t sub_cmd) override;
     /// ============================
 };
 } // namespace ublkpp

@@ -19,9 +19,11 @@ struct ublkpp_tgt {
 
     ~ublkpp_tgt();
 
-    static run_result_t run(boost::uuids::uuid const& vol_id, std::shared_ptr< UblkDisk > device);
+    static run_result_t run(boost::uuids::uuid const& vol_id, std::shared_ptr< UblkDisk > device, int device_id = -1);
     std::filesystem::path device_path() const;
     std::shared_ptr< UblkDisk > device() const;
+    int device_id() const;
+    void destroy();
 
 private:
     explicit ublkpp_tgt(std::shared_ptr< ublkpp_tgt_impl > p);

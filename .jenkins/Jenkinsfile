@@ -55,7 +55,7 @@ pipeline {
                     }
                     axis {
                         name 'SANITIZE'
-                        values 'False', 'True'
+                        values 'False', 'address'
                     }
                 }
                 excludes {
@@ -72,7 +72,7 @@ pipeline {
                     exclude {
                         axis {
                             name 'SANITIZE'
-                            values 'True'
+                            values 'address'
                         }
                         axis {
                             name 'COVERAGE'
@@ -82,7 +82,7 @@ pipeline {
                     exclude {
                         axis {
                             name 'SANITIZE'
-                            values 'True'
+                            values 'address'
                         }
                         axis {
                             name 'BUILD_TYPE'

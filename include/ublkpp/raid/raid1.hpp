@@ -1,9 +1,14 @@
 #pragma once
 
+#include <memory>
+
 #include <boost/uuid/uuid.hpp>
 #include <ublkpp/lib/ublk_disk.hpp>
 
 namespace ublkpp {
+
+class UblkRaidMetrics;
+
 namespace raid1 {
 class Raid1DiskImpl;
 ENUM(replica_state, uint8_t, CLEAN = 0, SYNCING = 1, ERROR = 2);
@@ -15,13 +20,15 @@ struct array_state {
 } // namespace raid1
 class Raid1Disk : public UblkDisk {
 public:
-    Raid1Disk(boost::uuids::uuid const& uuid, std::shared_ptr< UblkDisk > dev_a, std::shared_ptr< UblkDisk > dev_b);
+    Raid1Disk(boost::uuids::uuid const& uuid, std::shared_ptr< UblkDisk > dev_a, std::shared_ptr< UblkDisk > dev_b,
+              std::string const& parent_id = "");
     ~Raid1Disk() override;
 
     /// Raid1Disk API
     /// =============
     std::shared_ptr< UblkDisk > swap_device(std::string const& old_device_id, std::shared_ptr< UblkDisk > new_device);
     raid1::array_state replica_states() const;
+    uint64_t reserved_size() const;
     std::pair< std::shared_ptr< UblkDisk >, std::shared_ptr< UblkDisk > > replicas() const;
     void toggle_resync(bool t);
     /// =============
@@ -41,6 +48,8 @@ public:
     uint8_t route_size() const override;
 
     void idle_transition(ublksrv_queue const*, bool) override;
+
+    void on_io_complete(ublk_io_data const* data, sub_cmd_t sub_cmd) override;
 
     io_result handle_internal(ublksrv_queue const* q, ublk_io_data const* data, sub_cmd_t sub_cmd, iovec* iovec,
                               uint32_t nr_vecs, uint64_t addr, int res) override;

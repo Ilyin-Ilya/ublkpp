@@ -8,7 +8,7 @@ TEST(Raid0, SimpleWrite) {
         .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs,
                      uint32_t nr_vecs, uint64_t addr) {
             // Route is for Device B
-            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100000);
+            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b10000000);
             EXPECT_EQ(nr_vecs, 1);
             EXPECT_EQ(iovecs->iov_len, 16 * Ki);
             // This is the first chunk of the second device

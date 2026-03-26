@@ -4,10 +4,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## 0.15.1
-- Fix homeblock_disk linkage
+## 0.19.0
+- ublkpp_tgt: Allow oom killing of process.
 
-## 0.15.0
+## 0.18.x
+- ublkpp_tgt: Shutdown control device asynchronously.
+- ublkpp_tgt: add get device destroy api
+- ublkpp_tgt: add get device id api
+- raid1: Fix data races accessing superblock read_route field 
+- raid0: Increase route from 4 to 6 bits.
+- bitmap: SuperBitMap introduction. Improve the bitmap load_from speed by reading superbitmap first.
+- Feature: Device Recoverability
+
+## 0.17.x
+- bitmap: Increased shutdown speed by batching sync_to requests and tracking the unchanged pages
+- iomgr: Shutdown during process termination.
+- Introduce Metrics gathering
+
+## 0.16.x
+- fs_disk: Fix probing devices w/o partition.
+- raid1: Swap with no changes should have zero impact.
+- raid1: Reduce instance where a full copy is performed.
+- raid1: Fix disk position identification.
+- raid1: Improve disk recovery (non-new replace)
+- fs_disk: Support probing of partitions (e.g. /dev/sda1)
+- logging improvements
+- raid1: Improve disk replacement logic (swap_device)
+- raid1: Speed up Bitmap initialization
+- raid0: Optimize OPT_IO and PHY_IO to match array layout.
+- raid1: Fix reservation calculation to ensure user region is aligned to max i/o
+- raid1: Reservation size is now dynamically calculated during init, prevents resize
+
+## 0.15.x
+- Fix homeblock_disk linkage
 - Enable C++23 extensions
 - Replace usage of folly::Expected with std::expected
 

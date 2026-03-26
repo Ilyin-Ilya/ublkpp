@@ -13,13 +13,13 @@ TEST(Raid1, ReadRetryA) {
     EXPECT_CALL(*device_a, async_iov(_, _, _, _, _, _)).Times(0);
     EXPECT_CALL(*device_b, async_iov(_, _, _, _, _, _))
         .Times(1)
-        .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs, uint32_t,
-                     uint64_t addr) {
+        .WillOnce([&raid_device](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs,
+                                 uint32_t, uint64_t addr) {
             EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b11);
             // It should also have the RETRIED bit set
             EXPECT_TRUE(ublkpp::is_retry(sub_cmd));
             EXPECT_EQ(iovecs->iov_len, 4 * Ki);
-            EXPECT_EQ(addr, (12 * Ki) + reserved_size);
+            EXPECT_EQ(addr, (12 * Ki) + raid_device.reserved_size());
             return 1;
         });
 
@@ -34,14 +34,14 @@ TEST(Raid1, ReadRetryA) {
     // Now test the normal path
     EXPECT_CALL(*device_a, async_iov(_, _, _, _, _, _))
         .Times(1)
-        .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs, uint32_t,
-                     uint64_t addr) {
+        .WillOnce([&raid_device](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs,
+                                 uint32_t, uint64_t addr) {
             // The route has changed to point to device_b
             EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100);
             // It should not have the RETRIED bit set
             EXPECT_FALSE(ublkpp::is_retry(sub_cmd));
             EXPECT_EQ(iovecs->iov_len, 4 * Ki);
-            EXPECT_EQ(addr, (12 * Ki) + reserved_size);
+            EXPECT_EQ(addr, (12 * Ki) + raid_device.reserved_size());
             return 1;
         });
 
@@ -66,13 +66,13 @@ TEST(Raid1, ReadRetryB) {
 
     EXPECT_CALL(*device_a, async_iov(_, _, _, _, _, _))
         .Times(1)
-        .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs, uint32_t,
-                     uint64_t addr) {
+        .WillOnce([&raid_device](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs,
+                                 uint32_t, uint64_t addr) {
             EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100);
             // It should also have the RETRIED bit set
             EXPECT_TRUE(ublkpp::is_retry(sub_cmd));
             EXPECT_EQ(iovecs->iov_len, 64 * Ki);
-            EXPECT_EQ(addr, (32 * Ki) + reserved_size);
+            EXPECT_EQ(addr, (32 * Ki) + raid_device.reserved_size());
             return 1;
         });
     EXPECT_CALL(*device_b, async_iov(_, _, _, _, _, _)).Times(0);

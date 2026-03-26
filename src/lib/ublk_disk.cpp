@@ -65,7 +65,7 @@ io_result UblkDisk::sync_io(uint8_t op, void* buf, size_t len, off_t addr) {
 io_result UblkDisk::queue_tgt_io(ublksrv_queue const* q, ublk_io_data const* data, sub_cmd_t sub_cmd) {
     thread_local auto iov = iovec{.iov_base = nullptr, .iov_len = 0};
 
-    DLOGT("Queue I/O [tag:{:0x}] [sub_cmd:{}]", data->tag, ublkpp::to_string(sub_cmd))
+    DLOGT("Queue I/O [tag:{:#0x}] [sub_cmd:{}]", data->tag, ublkpp::to_string(sub_cmd))
     ublksrv_io_desc const* iod = data->iod;
     switch (ublksrv_get_op(iod)) {
     case UBLK_IO_OP_FLUSH:
@@ -94,11 +94,14 @@ io_result UblkDisk::queue_internal_resp(ublksrv_queue const* q, ublk_io_data con
 
 std::string UblkDisk::to_string() const {
     auto const cap_denom = capacity() >= Ti ? Gi : Mi;
-    return fmt::format("{}: params:(cap={}{},lbs={},max_tx={}Ki,discard={}{})", id(), capacity() / cap_denom,
-                       cap_denom == Gi ? "Gi" : "Mi", block_size(), (params()->basic.max_sectors << SECTOR_SHIFT) / Ki,
-                       can_discard(), direct_io ? "" : ", BUFFERED");
+    return fmt::format(
+        "[{}, size={}{}, lbs={:#0x}, pbs={:#0x}, io_opt={:#0x}, io_min={:#0x}, max_tx={}Ki, discard={}{}]", id(),
+        capacity() / cap_denom, cap_denom == Gi ? "Gi" : "Mi", block_size(), 1 << _params->basic.physical_bs_shift,
+        1 << _params->basic.io_opt_shift, 1 << _params->basic.io_min_shift,
+        (params()->basic.max_sectors << SECTOR_SHIFT) / Ki, can_discard(), direct_io ? "" : ", BUFFERED");
 }
 uint32_t UblkDisk::block_size() const { return 1 << _params->basic.logical_bs_shift; }
+uint32_t UblkDisk::max_tx() const { return _params->basic.max_sectors << SECTOR_SHIFT; }
 bool UblkDisk::can_discard() const { return _params->types & UBLK_PARAM_TYPE_DISCARD; }
 uint64_t UblkDisk::capacity() const { return _params->basic.dev_sectors << SECTOR_SHIFT; }
 

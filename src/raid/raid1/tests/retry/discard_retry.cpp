@@ -30,12 +30,12 @@ TEST(Raid1, DiscardRetry) {
     auto ublk_data = make_io_data(UBLK_IO_OP_READ);
     EXPECT_CALL(*device_a, async_iov(UBLK_IO_OP_READ, _, _, _, _, _))
         .Times(1)
-        .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs, uint32_t,
-                     uint64_t addr) {
+        .WillOnce([&raid_device](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs,
+                                 uint32_t, uint64_t addr) {
             EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100);
             EXPECT_FALSE(ublkpp::is_replicate(sub_cmd));
             EXPECT_EQ(iovecs->iov_len, 4 * Ki);
-            EXPECT_EQ(addr, (8 * Ki) + reserved_size);
+            EXPECT_EQ(addr, (8 * Ki) + raid_device.reserved_size());
             return 1;
         });
     EXPECT_CALL(*device_b, async_iov(_, _, _, _, _, _)).Times(0);
@@ -46,9 +46,9 @@ TEST(Raid1, DiscardRetry) {
     // expect unmount_clean on Device A
     EXPECT_TO_WRITE_SB(device_a);
     EXPECT_CALL(*device_a, sync_iov(UBLK_IO_OP_WRITE, _, _, _))
-        .WillOnce([](uint8_t, iovec* iov, uint32_t, off_t addr) -> io_result {
-            EXPECT_GE(addr, ublkpp::raid1::k_page_size); // Expect write to bitmap!
-            EXPECT_LT(addr, reserved_size);              // Expect write to bitmap!
+        .WillOnce([&raid_device](uint8_t, iovec* iov, uint32_t, off_t addr) -> io_result {
+            EXPECT_GE(addr, ublkpp::raid1::k_page_size);  // Expect write to bitmap!
+            EXPECT_LT(addr, raid_device.reserved_size()); // Expect write to bitmap!
             return iov->iov_len;
         })
         .RetiresOnSaturation();

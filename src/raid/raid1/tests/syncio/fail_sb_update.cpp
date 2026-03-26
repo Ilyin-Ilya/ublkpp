@@ -11,7 +11,7 @@ TEST(Raid1, SyncIoWriteFailDirty) {
     auto const test_off = 8 * Ki;
     auto const test_sz = 12 * Ki;
 
-    EXPECT_SYNC_OP(test_op, device_a, false, true, test_sz, test_off + reserved_size);
+    EXPECT_SYNC_OP(test_op, device_a, false, true, test_sz, test_off + raid_device.reserved_size());
     EXPECT_SB_OP(test_op, device_b, true, true);
 
     ASSERT_FALSE(raid_device.sync_io(UBLK_IO_OP_WRITE, nullptr, test_sz, test_off));

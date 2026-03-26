@@ -48,25 +48,26 @@ TEST(Raid1, CleanBitmap) {
         auto ublk_data = make_io_data(UBLK_IO_OP_WRITE, 32 * Ki, 0UL);
         EXPECT_CALL(*device_a, async_iov(_, _, _, _, _, _))
             .Times(1)
-            .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs, uint32_t,
-                         uint64_t addr) {
+            .WillOnce([&raid_device](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd,
+                                     iovec* iovecs, uint32_t, uint64_t addr) {
                 EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100);
                 EXPECT_FALSE(ublkpp::is_replicate(sub_cmd));
                 EXPECT_EQ(iovecs->iov_len, 32 * Ki);
-                EXPECT_EQ(addr, reserved_size);
+                EXPECT_EQ(addr, raid_device.reserved_size());
                 return 1;
             });
         ublkpp::sub_cmd_t internal_sub_cmd;
         EXPECT_CALL(*device_b, async_iov(_, _, _, _, _, _))
             .Times(1)
-            .WillOnce([&internal_sub_cmd](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd,
-                                          iovec* iovecs, uint32_t, uint64_t addr) {
+            .WillOnce([&internal_sub_cmd, &raid_device](ublksrv_queue const*, ublk_io_data const*,
+                                                        ublkpp::sub_cmd_t sub_cmd, iovec* iovecs, uint32_t,
+                                                        uint64_t addr) {
                 EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b101);
                 EXPECT_TRUE(ublkpp::is_replicate(sub_cmd));
                 EXPECT_TRUE(ublkpp::is_internal(sub_cmd));
                 internal_sub_cmd = sub_cmd;
                 EXPECT_EQ(iovecs->iov_len, 32 * Ki);
-                EXPECT_EQ(addr, reserved_size);
+                EXPECT_EQ(addr, raid_device.reserved_size());
                 return 1;
             });
         auto res = raid_device.handle_rw(nullptr, &ublk_data, 0b10, nullptr, 32 * Ki, 0UL);
@@ -79,12 +80,12 @@ TEST(Raid1, CleanBitmap) {
         // expect clean SB written on both devices
         EXPECT_CALL(*device_a, async_iov(_, _, _, _, _, _))
             .Times(1)
-            .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs, uint32_t,
-                         uint64_t addr) {
+            .WillOnce([&raid_device](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd,
+                                     iovec* iovecs, uint32_t, uint64_t addr) {
                 EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100);
                 EXPECT_EQ(iovecs->iov_len, 4 * Ki);
-                EXPECT_GE(addr, ublkpp::raid1::k_page_size); // Expect write to bitmap!
-                EXPECT_LT(addr, reserved_size);              // Expect write to bitmap!
+                EXPECT_GE(addr, ublkpp::raid1::k_page_size);  // Expect write to bitmap!
+                EXPECT_LT(addr, raid_device.reserved_size()); // Expect write to bitmap!
                 EXPECT_EQ(0, isal_zero_detect(iovecs->iov_base, ublkpp::raid1::k_page_size));
                 return 1;
             });

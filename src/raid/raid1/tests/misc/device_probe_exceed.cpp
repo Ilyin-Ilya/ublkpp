@@ -1,20 +1,17 @@
 #include "test_raid1_common.hpp"
 
-// Brief: Test that RAID1 array maintains a self-imposing limit to restrict the reserved size
+// Brief: Test that RAID1 array rejects devices larger than SuperBitmap can track
+// The SuperBitmap can track at most 32,176 bitmap pages (k_superbitmap_bits)
+// With 32KiB chunks, each bitmap page covers 1 GiB, giving a max capacity of ~31.4 TiB
 //
 TEST(Raid1, DevicesLargerThanAllowed) {
-    auto device_a = CREATE_DISK_A(TestParams{.capacity = ublkpp::raid1::k_max_dev_size + ublkpp::Ti});
-    auto device_b = CREATE_DISK_B(TestParams{.capacity = ublkpp::raid1::k_max_dev_size * 2});
+    // Create disks without SuperBlock read/write expectations since we'll throw before those operations
+    auto device_a = CREATE_DISK_F(TestParams{.capacity = UINT64_MAX}, false, true, false, true, false);
+    auto device_b = CREATE_DISK_F(TestParams{.capacity = UINT64_MAX}, true, true, false, true, false);
 
-    auto raid_device = ublkpp::Raid1Disk(boost::uuids::string_generator()(test_uuid), device_a, device_b);
-    EXPECT_EQ(raid_device.capacity(), ublkpp::raid1::k_max_dev_size);
-    EXPECT_STREQ(raid_device.id().c_str(), "RAID1");
-
-    // CanDiscard and DirectIO `true` be default.
-    EXPECT_EQ(raid_device.can_discard(), true);
-    EXPECT_EQ(raid_device.direct_io, true);
-
-    // expect unmount_clean update
-    EXPECT_TO_WRITE_SB(device_a);
-    EXPECT_TO_WRITE_SB(device_b);
+    // Should throw exception for devices exceeding SuperBitmap capacity
+    EXPECT_THROW(
+        ublkpp::Raid1Disk(boost::uuids::string_generator()(test_uuid), device_a, device_b),
+        std::runtime_error
+    );
 }

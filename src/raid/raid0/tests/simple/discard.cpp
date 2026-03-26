@@ -8,7 +8,7 @@ TEST(Raid0, SimpleDiscard) {
         .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, uint32_t const len,
                      uint64_t const addr) {
             // Route is for Device A
-            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100000);
+            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b10000000);
             EXPECT_EQ(len, 28 * Ki);
             EXPECT_EQ(addr, (32 * Ki) + (100 * Ki));
             return 1;

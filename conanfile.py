@@ -10,7 +10,7 @@ required_conan_version = ">=2.0"
 
 class UBlkPPConan(ConanFile):
     name = "ublkpp"
-    version = "0.15.1"
+    version = "0.19.0"
 
     homepage = "https://github.com/szmyd/ublkpp"
     description = "A UBlk library for CPP application"
@@ -24,7 +24,7 @@ class UBlkPPConan(ConanFile):
                 "shared": ['True', 'False'],
                 "fPIC": ['True', 'False'],
                 "coverage": ['True', 'False'],
-                "sanitize": ['True', 'False'],
+                "sanitize": ['address', 'thread', 'False'],
                 "homeblocks": ['True', 'False'],
                 "iscsi": ['True', 'False'],
                 }
@@ -47,7 +47,7 @@ class UBlkPPConan(ConanFile):
                         )
 
     def _min_cppstd(self):
-        return 23
+        return 20
 
     def validate(self):
         if self.settings.compiler.get_safe("cppstd"):
@@ -69,21 +69,22 @@ class UBlkPPConan(ConanFile):
 
     def build_requirements(self):
         self.test_requires("gtest/1.17.0")
+        self.test_requires("iomgr/[^12]@oss/master")
 
     def requirements(self):
         self.requires("sisl/[^13]@oss/master", transitive_headers=True)
 
         self.requires("isa-l/2.30.0")
         if (self.options.get_safe("homeblocks")):
-            self.requires("homeblocks/[^4.0]@oss/main")
+            self.requires("homeblocks/[^5.0]@oss/main")
         self.requires("ublksrv/nbi.1.5.0")
         if (self.options.get_safe("iscsi")):
             self.requires("libiscsi/1.20.3")
 
     def layout(self):
         self.folders.source = "."
-        if self.options.get_safe("sanitize"):
-            self.folders.build = join("build", "Sanitized")
+        if self.options.get_safe("sanitize") and self.options.sanitize != "False":
+            self.folders.build = join("build", f"Sanitized-{self.options.sanitize}")
         elif self.options.get_safe("coverage"):
             self.folders.build = join("build", "Coverage")
         else:
@@ -101,6 +102,7 @@ class UBlkPPConan(ConanFile):
     def generate(self):
         # This generates "conan_toolchain.cmake" in self.generators_folder
         tc = CMakeToolchain(self)
+        tc.variables["CMAKE_EXPORT_COMPILE_COMMANDS"] = "ON"
         tc.variables["CTEST_OUTPUT_ON_FAILURE"] = "ON"
         tc.variables["PACKAGE_VERSION"] = self.version
         tc.variables["ENABLE_TESTS"] = "ON"
@@ -109,8 +111,11 @@ class UBlkPPConan(ConanFile):
         if self.settings.build_type == "Debug":
             if self.options.get_safe("coverage"):
                 tc.variables['BUILD_COVERAGE'] = 'ON'
-            elif self.options.get_safe("sanitize"):
-                tc.variables['MEMORY_SANITIZER_ON'] = 'ON'
+            elif self.options.get_safe("sanitize") and self.options.sanitize != "False":
+                if self.options.sanitize == "thread":
+                    tc.variables['THREAD_SANITIZER_ON'] = 'ON'
+                else:  # address
+                    tc.variables['ADDRESS_SANITIZER_ON'] = 'ON'
         tc.generate()
 
         deps = CMakeDeps(self)
@@ -130,11 +135,20 @@ class UBlkPPConan(ConanFile):
         copy(self, "*.so", self.build_folder, join(self.package_folder, "lib"), keep_path=False)
 
     def package_info(self):
-        if self.options.get_safe("sanitize"):
-            self.cpp_info.sharedlinkflags.append("-fsanitize=address")
-            self.cpp_info.exelinkflags.append("-fsanitize=address")
-            self.cpp_info.sharedlinkflags.append("-fsanitize=undefined")
-            self.cpp_info.exelinkflags.append("-fsanitize=undefined")
+        self.cpp_info.requires = ["sisl::cache", "isa-l::isa-l", "ublksrv::ublksrv"]
+        if (self.options.get_safe("iscsi")):
+            self.cpp_info.requires.extend(["libiscsi::libiscsi"])
+        if (self.options.get_safe("homeblocks")):
+            self.cpp_info.requires.extend(["homeblocks::homeblocks"])
+        if self.options.get_safe("sanitize") and self.options.sanitize != "False":
+            if self.options.sanitize == "thread":
+                self.cpp_info.sharedlinkflags.append("-fsanitize=thread")
+                self.cpp_info.exelinkflags.append("-fsanitize=thread")
+            else:
+                self.cpp_info.sharedlinkflags.append("-fsanitize=address")
+                self.cpp_info.exelinkflags.append("-fsanitize=address")
+                self.cpp_info.sharedlinkflags.append("-fsanitize=undefined")
+                self.cpp_info.exelinkflags.append("-fsanitize=undefined")
 
         self.cpp_info.set_property("cmake_file_name", "UblkPP")
         self.cpp_info.set_property("cmake_target_name", "UblkPP::UblkPP")

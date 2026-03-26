@@ -10,7 +10,7 @@ TEST(Raid0, MergedDiscardRetry) {
         .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, uint32_t const len,
                      uint64_t const addr) {
             // Route is for Device A
-            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100000);
+            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b10000000);
             EXPECT_EQ(len, 32 * Ki);
             EXPECT_EQ(addr, (64 * Ki));
             return 1;
@@ -22,7 +22,7 @@ TEST(Raid0, MergedDiscardRetry) {
                                          std::vector< std::shared_ptr< UblkDisk > >{device_a, device_b, device_c});
 
     auto ublk_data = make_io_data(UBLK_IO_OP_DISCARD);
-    auto const retried_route = ublkpp::set_flags(ublkpp::sub_cmd_t{0b100000}, ublkpp::sub_cmd_flags::RETRIED);
+    auto const retried_route = ublkpp::set_flags(ublkpp::sub_cmd_t{0b10000000}, ublkpp::sub_cmd_flags::RETRIED);
 
     // Set the address to within the second stripe (32KiB stripes)
     auto res = raid_device.handle_discard(nullptr, &ublk_data, retried_route, 100 * Ki, 36 * Ki);

@@ -7,24 +7,24 @@ TEST(Raid1, SimpleDiscard) {
 
     EXPECT_CALL(*device_a, handle_discard(_, _, _, _, _))
         .Times(1)
-        .WillOnce(
-            [](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, uint32_t len, uint64_t addr) {
-                EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100);
-                EXPECT_FALSE(ublkpp::is_replicate(sub_cmd));
-                EXPECT_EQ(len, 4 * Ki);
-                EXPECT_EQ(addr, (8 * Ki) + reserved_size);
-                return 1;
-            });
+        .WillOnce([&raid_device](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, uint32_t len,
+                                 uint64_t addr) {
+            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100);
+            EXPECT_FALSE(ublkpp::is_replicate(sub_cmd));
+            EXPECT_EQ(len, 4 * Ki);
+            EXPECT_EQ(addr, (8 * Ki) + raid_device.reserved_size());
+            return 1;
+        });
     EXPECT_CALL(*device_b, handle_discard(_, _, _, _, _))
         .Times(1)
-        .WillOnce(
-            [](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, uint32_t len, uint64_t addr) {
-                EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b101);
-                EXPECT_TRUE(ublkpp::is_replicate(sub_cmd));
-                EXPECT_EQ(len, 4 * Ki);
-                EXPECT_EQ(addr, (8 * Ki) + reserved_size);
-                return 1;
-            });
+        .WillOnce([&raid_device](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, uint32_t len,
+                                 uint64_t addr) {
+            EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b101);
+            EXPECT_TRUE(ublkpp::is_replicate(sub_cmd));
+            EXPECT_EQ(len, 4 * Ki);
+            EXPECT_EQ(addr, (8 * Ki) + raid_device.reserved_size());
+            return 1;
+        });
 
     auto ublk_data = make_io_data(UBLK_IO_OP_DISCARD, 4 * Ki, 8 * Ki);
     auto res = raid_device.queue_tgt_io(nullptr, &ublk_data, 0b10);

@@ -61,7 +61,7 @@ TEST(Raid1, WriteRetryA) {
                 EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b101);
                 EXPECT_FALSE(ublkpp::is_replicate(sub_cmd));
                 EXPECT_EQ(iovecs->iov_len, 4 * Ki);
-                EXPECT_EQ(addr, (8 * Ki) + reserved_size);
+                EXPECT_EQ(addr, (8 * Ki) + raid_device.reserved_size());
                 return 1;
             });
         auto res = raid_device.handle_rw(nullptr, &ublk_data, 0b10, nullptr, 4 * Ki, 8 * Ki);
@@ -80,7 +80,7 @@ TEST(Raid1, WriteRetryA) {
                 EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b101);
                 EXPECT_FALSE(ublkpp::is_replicate(sub_cmd));
                 EXPECT_EQ(iovecs->iov_len, 4 * Ki);
-                EXPECT_EQ(addr, (180 * Ki) + reserved_size);
+                EXPECT_EQ(addr, (180 * Ki) + raid_device.reserved_size());
                 return 1;
             });
         auto res = raid_device.handle_rw(nullptr, &ublk_data, 0b10, nullptr, 4 * Ki, 180 * Ki);
@@ -116,7 +116,7 @@ TEST(Raid1, WriteRetryA) {
                 EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b101);
                 EXPECT_FALSE(ublkpp::is_replicate(sub_cmd));
                 EXPECT_EQ(iovecs->iov_len, 4 * Ki);
-                EXPECT_EQ(addr, (220 * Ki) + reserved_size);
+                EXPECT_EQ(addr, (220 * Ki) + raid_device.reserved_size());
                 return 1;
             });
         auto res = raid_device.handle_rw(nullptr, &ublk_data, 0b10, nullptr, 4 * Ki, 220 * Ki);
@@ -144,7 +144,7 @@ TEST(Raid1, WriteRetryA) {
                 EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b101);
                 EXPECT_FALSE(ublkpp::is_replicate(sub_cmd));
                 EXPECT_EQ(iovecs->iov_len, 320 * Ki);
-                EXPECT_EQ(addr, reserved_size);
+                EXPECT_EQ(addr, raid_device.reserved_size());
                 return 1;
             });
         auto res = raid_device.handle_rw(nullptr, &ublk_data, 0b10, nullptr, 320 * Ki, 0UL);
@@ -171,7 +171,7 @@ TEST(Raid1, WriteRetryA) {
                 EXPECT_TRUE(ublkpp::is_internal(sub_cmd));
                 internal_sub_cmd = sub_cmd;
                 EXPECT_EQ(iovecs->iov_len, 320 * Ki);
-                EXPECT_EQ(addr, reserved_size);
+                EXPECT_EQ(addr, raid_device.reserved_size());
                 return 1;
             });
         EXPECT_CALL(*device_b, async_iov(_, _, _, _, _, _))
@@ -181,7 +181,7 @@ TEST(Raid1, WriteRetryA) {
                 EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b101);
                 EXPECT_FALSE(ublkpp::is_replicate(sub_cmd));
                 EXPECT_EQ(iovecs->iov_len, 320 * Ki);
-                EXPECT_EQ(addr, reserved_size);
+                EXPECT_EQ(addr, raid_device.reserved_size());
                 return 1;
             });
         auto res = raid_device.handle_rw(nullptr, &ublk_data, 0b10, nullptr, 320 * Ki, 0UL);
@@ -258,7 +258,7 @@ TEST(Raid1, WriteRetryB) {
                 EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100);
                 EXPECT_FALSE(ublkpp::is_replicate(sub_cmd));
                 EXPECT_EQ(iovecs->iov_len, 64 * Ki);
-                EXPECT_EQ(addr, Gi - (32 * Ki) + reserved_size);
+                EXPECT_EQ(addr, Gi - (32 * Ki) + raid_device.reserved_size());
                 return 1;
             });
         auto res = raid_device.handle_rw(nullptr, &ublk_data, 0b10, nullptr, 64 * Ki, Gi - (32 * Ki));
@@ -286,7 +286,7 @@ TEST(Raid1, WriteRetryB) {
                 EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b100);
                 EXPECT_FALSE(ublkpp::is_replicate(sub_cmd));
                 EXPECT_EQ(iovecs->iov_len, 320 * Ki);
-                EXPECT_EQ(addr, Gi - (64 * Ki) + reserved_size);
+                EXPECT_EQ(addr, Gi - (64 * Ki) + raid_device.reserved_size());
                 return 1;
             });
         ublkpp::sub_cmd_t internal_sub_cmd;
@@ -299,7 +299,7 @@ TEST(Raid1, WriteRetryB) {
                 EXPECT_TRUE(ublkpp::is_internal(sub_cmd));
                 internal_sub_cmd = sub_cmd;
                 EXPECT_EQ(iovecs->iov_len, 320 * Ki);
-                EXPECT_EQ(addr, Gi - (64 * Ki) + reserved_size);
+                EXPECT_EQ(addr, Gi - (64 * Ki) + raid_device.reserved_size());
                 return 1;
             });
         auto res = raid_device.handle_rw(nullptr, &ublk_data, 0b10, nullptr, 320 * Ki, Gi - (64 * Ki));
@@ -321,8 +321,8 @@ TEST(Raid1, WriteRetryB) {
 
     EXPECT_CALL(*device_a, sync_iov(UBLK_IO_OP_WRITE, _, _, _))
         .WillOnce([](uint8_t, iovec* iov, uint32_t, off_t addr) -> io_result {
-            EXPECT_GE(addr, ublkpp::raid1::k_page_size); // Expect write to bitmap!
-            EXPECT_LT(addr, reserved_size);              // Expect write to bitmap!
+            EXPECT_GE(addr, ublkpp::raid1::k_page_size);  // Expect write to bitmap!
+            EXPECT_LT(addr, raid_device.reserved_size()); // Expect write to bitmap!
             return iov->iov_len;
         })
         .RetiresOnSaturation();

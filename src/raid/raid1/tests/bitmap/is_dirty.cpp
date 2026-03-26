@@ -2,25 +2,29 @@
 #include <gtest/gtest.h>
 
 #include "raid/raid1/bitmap.hpp"
+#include "raid/raid1/tests/test_raid1_common.hpp"
 
 using ublkpp::Ki;
 
 // Ensure that all required pages are initialized
 TEST(Raid1, DoesNotCrossPage) {
-    auto bitmap = ublkpp::raid1::Bitmap(2 * ublkpp::Gi, 32 * Ki, 4 * Ki);
+    auto superbitmap_buf = make_test_superbitmap();
+    auto bitmap = ublkpp::raid1::Bitmap(2 * ublkpp::Gi, 32 * Ki, 4 * Ki, superbitmap_buf.get());
     bitmap.dirty_region(ublkpp::Gi - (4 * Ki), 12 * Ki);
     EXPECT_TRUE(bitmap.is_dirty(ublkpp::Gi + (4 * Ki), 4 * Ki));
 }
 
 TEST(Raid1, IsDirtyNextPage) {
-    auto bitmap = ublkpp::raid1::Bitmap(2 * ublkpp::Gi, 32 * Ki, 4 * Ki);
+    auto superbitmap_buf = make_test_superbitmap();
+    auto bitmap = ublkpp::raid1::Bitmap(2 * ublkpp::Gi, 32 * Ki, 4 * Ki, superbitmap_buf.get());
     bitmap.dirty_region(ublkpp::Gi + (4 * Ki), 12 * Ki);
     EXPECT_TRUE(bitmap.is_dirty(ublkpp::Gi - (4 * Ki), 8 * Ki));
 }
 
 // Some actual problematic Bitmap bugs encountered when testing BufferedI/O
 TEST(Raid1, BufferedIoTest) {
-    auto bitmap = ublkpp::raid1::Bitmap(2 * ublkpp::Gi, 32 * Ki, 4 * Ki);
+    auto superbitmap_buf = make_test_superbitmap();
+    auto bitmap = ublkpp::raid1::Bitmap(2 * ublkpp::Gi, 32 * Ki, 4 * Ki, superbitmap_buf.get());
     bitmap.dirty_region(0xf7b000, 512 * Ki);
     bitmap.dirty_region(0xffb000, 512 * Ki);
     bitmap.dirty_region(0x22ac000, 512 * Ki);

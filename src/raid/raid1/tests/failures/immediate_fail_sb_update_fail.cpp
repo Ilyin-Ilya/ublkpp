@@ -32,8 +32,8 @@ TEST(Raid1, WriteFailImmediateFailFailSBUpdate) {
                      uint64_t addr) {
             EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b101);
             EXPECT_EQ(iovecs->iov_len, 4 * Ki);
-            EXPECT_GE(addr, ublkpp::raid1::k_page_size); // Expect write to bitmap!
-            EXPECT_LT(addr, reserved_size);              // Expect write to bitmap!
+            EXPECT_GE(addr, ublkpp::raid1::k_page_size);  // Expect write to bitmap!
+            EXPECT_LT(addr, raid_device.reserved_size()); // Expect write to bitmap!
             return 1;
         })
         .WillOnce([](ublksrv_queue const*, ublk_io_data const*, ublkpp::sub_cmd_t sub_cmd, iovec* iovecs, uint32_t,
@@ -41,7 +41,7 @@ TEST(Raid1, WriteFailImmediateFailFailSBUpdate) {
             EXPECT_EQ(sub_cmd & ublkpp::_route_mask, 0b101);
             EXPECT_FALSE(ublkpp::is_replicate(sub_cmd));
             EXPECT_EQ(iovecs->iov_len, 4 * Ki);
-            EXPECT_EQ(addr, (8 * Ki) + reserved_size);
+            EXPECT_EQ(addr, (8 * Ki) + raid_device.reserved_size());
             return 1;
         });
     auto res = raid_device.handle_rw(nullptr, &ublk_data, 0b10, nullptr, 4 * Ki, 8 * Ki);

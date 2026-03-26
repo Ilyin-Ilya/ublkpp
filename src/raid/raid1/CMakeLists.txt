@@ -6,10 +6,11 @@ target_sources(raid1 PRIVATE
     raid1_pimpl.cpp
     raid1_superblock.cpp
     bitmap.cpp
+    super_bitmap.cpp
 )
 target_link_libraries(raid1
     isa-l::isa-l
-    sisl::sisl
+    sisl::cache
     ublksrv::ublksrv
 )
 
