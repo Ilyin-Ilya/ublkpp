@@ -387,7 +387,14 @@ bool Raid1Disk::__swap_device(std::string const& outgoing_device_id, std::shared
         // Rollback
         _sb->fields.bitmap.age = htobe64(old_age);
         outgoing_dev.swap(incoming_mirror);
-        _read_route_cache.compare_exchange_strong(new_read_route, cur_route);
+        if (!_read_route_cache.compare_exchange_strong(new_read_route, cur_route)) {
+            // Only reachable if __become_clean() raced into the window between the
+            // write_superblock failure and this CAS and already advanced route to EITHER.
+            // Device pointers and age are restored; route is EITHER which is consistent.
+            RLOGE("swap_device rollback CAS failed [uuid:{}]: route changed concurrently; "
+                  "device pointers and age restored",
+                  _str_uuid)
+        }
         return false;
     }
     // Commit SuperBlock to new device; if this fails it's not fatal per say...could work
@@ -625,13 +632,19 @@ void Raid1Disk::__become_clean() {
     // - When route == DEVB: active_dev is B (is_device_b=true), backup_dev is A (is_device_b=false)
     bool const active_is_device_b = (state.route == read_route::DEVB);
 
-    if (auto sync_res = write_superblock(*state.active_dev->disk, _sb.get(), active_is_device_b, read_route::EITHER);
-        !sync_res) {
-        RLOGW("Could not become clean [uuid:{}]: {}", _str_uuid, sync_res.error().message())
+    // Active device write must succeed before we CAS to EITHER. If it fails, leave the
+    // in-memory route at DEVA/DEVB so it matches the still-degraded on-disk state; diverging
+    // the two would produce wrong startup behaviour on the next mount.
+    if (auto active_res = write_superblock(*state.active_dev->disk, _sb.get(), active_is_device_b, read_route::EITHER);
+        !active_res) {
+        RLOGE("Could not become clean [uuid:{}]: active SB write failed: {}", _str_uuid, active_res.error().message())
+        return;
     }
     if (auto sync_res = write_superblock(*state.backup_dev->disk, _sb.get(), !active_is_device_b, read_route::EITHER);
         !sync_res) {
-        RLOGW("Could not become clean [uuid:{}]: {}", _str_uuid, sync_res.error().message())
+        // Backup write failure is non-fatal: the active device already has the clean SB.
+        // On next restart pick_superblock will choose the active (higher age) device correctly.
+        RLOGW("Could not write clean SB to backup [uuid:{}]: {}", _str_uuid, sync_res.error().message())
     }
 
     // Avoid checking DirtyBitmap going forward on reads/writes
@@ -739,15 +752,18 @@ Raid1Disk::__select_read_devices(RouteState const& state, uint64_t addr, uint32_
         if (route != state.route) route = state.route;
         backup_stale = true;
     }
+    last_read = route;
+    auto redirected_unavail = false;
     if (!state.is_degraded && __route_to_device(state, route)->unavail.test(std::memory_order_acquire)) {
         route = (route == read_route::DEVA) ? read_route::DEVB : read_route::DEVA;
+        redirected_unavail = true;
         RLOGD("Skipping unavail device, routing to alternate")
     }
-
-    last_read = route;
     auto const other_route = (route == read_route::DEVA) ? read_route::DEVB : read_route::DEVA;
+    // Suppress failover when backup is stale (degraded+dirty) or when we already redirected away
+    // from an unavail device — falling back to a device that missed writes returns stale data.
     return {__route_to_device(state, route),
-            backup_stale ? std::nullopt : std::optional{__route_to_device(state, other_route)}};
+            (backup_stale || redirected_unavail) ? std::nullopt : std::optional{__route_to_device(state, other_route)}};
 }
 
 bool Raid1Disk::__backup_writable(RouteState const& state, uint64_t addr, uint32_t len) const noexcept {

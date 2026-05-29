@@ -95,6 +95,15 @@ void Raid1ResyncTask::_start(std::string str_uuid, std::shared_ptr< MirrorDevice
         } // LCOV_EXCL_STOP
 
         cur_state = __run(clean_mirror, dirty_mirror, &iov);
+        // I/O may have been interrupted; if not, check the bitmap and mark as clean.
+        // Must run before free(iov.iov_base) so the re-check pass can reuse the buffer.
+        if (resync_state::ACTIVE == cur_state && 0 == _dirty_bitmap->dirty_pages()) {
+            complete();
+            // Re-check: a write concurrent with complete() ran against the active device only
+            // (route was still DEVA/DEVB). Now route is EITHER so new writes go to both mirrors
+            // and can't add dirty pages; one extra pass cleans any pages dirtied in the window.
+            if (0 < _dirty_bitmap->dirty_pages()) cur_state = __run(clean_mirror, dirty_mirror, &iov);
+        }
         free(iov.iov_base);
 
         if (_metrics) { // GCOVR_EXCL_BR_LINE
@@ -119,10 +128,7 @@ void Raid1ResyncTask::_start(std::string str_uuid, std::shared_ptr< MirrorDevice
         return;
     }
 
-    // Otherwise we _should_ be active (not paused or idle), if the bitmap is clean call complete
     DEBUG_ASSERT_EQ(resync_state::ACTIVE, cur_state, "Resync stopped in unexpected state");
-    // I/O may have been interrupted, if not check the bitmap and mark us as _clean_
-    if (0 == _dirty_bitmap->dirty_pages()) complete();
     RLOGD("Resync Task Finished for [uuid:{}] to: {}", str_uuid, *dirty_mirror->disk)
 
     // Open up I/O Again

@@ -12,5 +12,6 @@ list(APPEND RAID1_TEST_SRCS
   concurrency/multi_queue_idle.cpp
   concurrency/concurrent_enqueue_dequeue.cpp
   concurrency/write_resync_no_pause.cpp
+  concurrency/resync_toctou_window.cpp
 )
 set(RAID1_TEST_SRCS "${RAID1_TEST_SRCS}" PARENT_SCOPE)
