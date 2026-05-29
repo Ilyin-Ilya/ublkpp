@@ -752,18 +752,15 @@ Raid1Disk::__select_read_devices(RouteState const& state, uint64_t addr, uint32_
         if (route != state.route) route = state.route;
         backup_stale = true;
     }
-    last_read = route;
-    auto redirected_unavail = false;
     if (!state.is_degraded && __route_to_device(state, route)->unavail.test(std::memory_order_acquire)) {
         route = (route == read_route::DEVA) ? read_route::DEVB : read_route::DEVA;
-        redirected_unavail = true;
         RLOGD("Skipping unavail device, routing to alternate")
     }
+
+    last_read = route;
     auto const other_route = (route == read_route::DEVA) ? read_route::DEVB : read_route::DEVA;
-    // Suppress failover when backup is stale (degraded+dirty) or when we already redirected away
-    // from an unavail device — falling back to a device that missed writes returns stale data.
     return {__route_to_device(state, route),
-            (backup_stale || redirected_unavail) ? std::nullopt : std::optional{__route_to_device(state, other_route)}};
+            backup_stale ? std::nullopt : std::optional{__route_to_device(state, other_route)}};
 }
 
 bool Raid1Disk::__backup_writable(RouteState const& state, uint64_t addr, uint32_t len) const noexcept {

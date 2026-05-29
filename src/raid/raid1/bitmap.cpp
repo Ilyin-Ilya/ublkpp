@@ -207,7 +207,6 @@ void Bitmap::load_from(ublk_disk& device) {
         _page_map[pg_idx]._page_mem = iov.iov_base;
         _page_map[pg_idx].page.store(reinterpret_cast< word_t* >(iov.iov_base), std::memory_order_relaxed);
         _page_map[pg_idx].loaded_from_disk.store(true, std::memory_order_relaxed);
-        _super_bitmap.set_bit(pg_idx);
         iov.iov_base = nullptr;
     }
     if (nullptr != iov.iov_base) free(iov.iov_base);
