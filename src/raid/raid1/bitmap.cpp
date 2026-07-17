@@ -299,9 +299,11 @@ size_t Bitmap::dirty_pages() noexcept {
 std::tuple< Bitmap::word_t*, uint32_t, uint32_t > Bitmap::clean_region(uint64_t addr, uint32_t len) noexcept {
     auto [page_offset, word_offset, shift_offset, nr_bits, sz] = calc_bitmap_region(addr, len, _chunk_size);
 
-    // Address and Length should be chunk aligned!
+    // Address must be chunk aligned. Length need NOT be: the final region of a full-capacity resync
+    // is clamped to capacity(), which is not necessarily a chunk multiple, so the tail is a partial
+    // chunk. calc_bitmap_region rounds nr_bits up (as is_dirty also relies on), so the covering chunk
+    // bit is still cleared correctly.
     DEBUG_ASSERT_EQ(0, addr % _chunk_size, "Address [addr:{:#0x}] is not aligned to {:#0x}", addr, _chunk_size)
-    DEBUG_ASSERT_EQ(0, len % _chunk_size, "Len [len:{:#0x}] is not aligned to {:#0x}", len, _chunk_size)
 
     auto& page_data = _page_map[page_offset];
     auto page = page_data.page.load(std::memory_order_acquire);

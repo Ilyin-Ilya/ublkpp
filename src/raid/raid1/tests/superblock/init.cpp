@@ -59,7 +59,10 @@ TEST(Raid1, InitSuperBlock) {
             EXPECT_EQ(0, memcmp(&normal_superblock, iovecs->iov_base, sizeof(ublkpp::raid1::SuperBlock::header)));
             return ublkpp::raid1::k_page_size;
         });
-    auto raid_device = ublkpp::raid1::Raid1Disk(boost::uuids::string_generator()(test_uuid), device_a, device_b);
+    // assume_clean: both legs read zero, skipping the new-array initial sync -- this test asserts
+    // SB initialization, not resync policy (see Raid1ModeSelection.FreshPairInitialSync for that).
+    auto raid_device =
+        ublkpp::raid1::Raid1Disk(boost::uuids::string_generator()(test_uuid), device_a, device_b, "", true);
     EXPECT_TO_WRITE_SB(device_a);
     EXPECT_TO_WRITE_SB(device_b);
 }

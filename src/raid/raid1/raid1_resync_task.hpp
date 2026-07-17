@@ -60,6 +60,16 @@ class Raid1ResyncTask {
     // This is the offset we should copy the disks @ to avoid writing on the BITMAP itself.
     uint64_t const _offset;
 
+    // Fallback copy-mode storage, used only when no external mode source is supplied -- mode-agnostic
+    // unit tests (the concurrency/region-tracker suites) that just want the default BLIND behavior.
+    std::atomic< resync_copy_mode > _owned_mode{resync_copy_mode::BLIND};
+    // The single authoritative (persisted) copy mode: Raid1Disk::_resync_mode in production, the copy-
+    // mode tests' own atomic otherwise, else &_owned_mode. The task reads it fresh per copy so an
+    // I/O-path re-dirty or this run's own Phase-2 conflict is observed immediately, and publishes the
+    // ZERO_TEST -> CHECK downgrade back through it so the change is durable across a stop/relaunch.
+    // Owned by Raid1Disk, which joins this task before the atomic is destroyed.
+    std::atomic< resync_copy_mode >* const _live_mode;
+
     std::atomic< resync_state > _state{resync_state::IDLE};
     static_assert(std::atomic< resync_state >::is_always_lock_free);
 
@@ -78,7 +88,13 @@ class Raid1ResyncTask {
         return _state.compare_exchange_weak(expected, desired, std::memory_order_acq_rel, std::memory_order_acquire);
     }
 
-    resync_state __run(auto& clean_mirror, auto& dirty_mirror, iovec* iov) noexcept;
+    // iov: source/scratch buffer. cmp_iov: destination-read buffer (CHECK, and ZERO_TEST which may
+    // downgrade). The effective mode is re-read from _live_mode per copy; a write conflicting with a
+    // ZERO_TEST copy publishes ZERO_TEST -> CHECK through _live_mode so the deferred region re-syncs
+    // via compare (not a stale zero-skip) and the downgrade persists. blind_fallback pins the run to
+    // BLIND when the compare buffer could not be allocated -- a run-local fallback, never published.
+    resync_state __run(auto& clean_mirror, auto& dirty_mirror, iovec* iov, iovec* cmp_iov,
+                       bool blind_fallback) noexcept;
 
     // Generic state transition helper - reduces duplication across launch/stop.
     // noinline: gcov attributes inlined template instructions to the call-site line numbers
@@ -95,7 +111,8 @@ class Raid1ResyncTask {
 
 public:
     Raid1ResyncTask(std::shared_ptr< raid1::Bitmap >& bitmap, uint64_t offset, uint32_t io_size, uint32_t max_io,
-                    uint32_t slot_count = k_default_slot_count, uint32_t chunk_size = k_min_chunk_size,
+                    std::atomic< resync_copy_mode >* live_mode = nullptr, uint32_t slot_count = k_default_slot_count,
+                    uint32_t chunk_size = k_min_chunk_size,
                     std::shared_ptr< ublkpp::UblkRaidMetrics > metrics = nullptr);
     ~Raid1ResyncTask() noexcept;
 
@@ -103,6 +120,7 @@ public:
     // sets unavail on failure. Returns true if device is available.
     static bool probe_mirror(MirrorDevice& mirror, uint64_t reserved_size) noexcept;
 
+    // The copy mode is read from _live_mode (Raid1Disk::_resync_mode); see resync_copy_mode.
     void launch(std::string const& str_uuid, std::shared_ptr< MirrorDevice > clean_mirror,
                 std::shared_ptr< MirrorDevice > dirty_mirror, std::function< bool() >&& complete);
 

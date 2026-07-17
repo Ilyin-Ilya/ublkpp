@@ -10,10 +10,11 @@ namespace ublkpp::raid1 {
 auto format_as(SuperBlock const& sb) {
     auto read_uuid = boost::uuids::uuid();
     memcpy(read_uuid.data, sb.header.uuid, sizeof(sb.header.uuid));
-    return fmt::format("[uuid:{}, ver:{:#0x}, age:{}, chunk_sz:{}Ki, read_route:{} (Side-{}:{})]", to_string(read_uuid),
-                       be16toh(sb.header.version), be64toh(sb.fields.bitmap.age),
+    return fmt::format("[uuid:{}, ver:{:#0x}, age:{}, chunk_sz:{}Ki, read_route:{} (Side-{}:{}), resync:{}]",
+                       to_string(read_uuid), be16toh(sb.header.version), be64toh(sb.fields.bitmap.age),
                        be32toh(sb.fields.bitmap.chunk_size) / Ki, static_cast< read_route >(sb.fields.read_route),
-                       sb.fields.device_b ? "B" : "A", sb.fields.clean_unmount ? "Clean" : "Active");
+                       sb.fields.device_b ? "B" : "A", sb.fields.clean_unmount ? "Clean" : "Active",
+                       static_cast< resync_copy_mode >(sb.fields.bitmap.resync_mode));
 }
 
 raid1::SuperBlock* pick_superblock(raid1::SuperBlock* dev_a, raid1::SuperBlock* dev_b) {
@@ -27,19 +28,17 @@ raid1::SuperBlock* pick_superblock(raid1::SuperBlock* dev_a, raid1::SuperBlock* 
         dev_a->fields.read_route = static_cast< uint8_t >(read_route::DEVA);
         return dev_a;
     } else if (dev_a->fields.clean_unmount != dev_b->fields.clean_unmount) {
-        // Ages are equal but clean_unmount differs. This can only happen when the shutdown write
-        // of clean_unmount=1 succeeded on one device but not the other — no data write can cause
-        // this because any data-write failure immediately degrades the array and diverges the ages.
-        // Equal ages therefore guarantee both devices are bit-for-bit identical: the bitmap is
-        // irrelevant and there is nothing to resync. Opening with the existing on-disk route
-        // (EITHER for a previously healthy array, DEVA/DEVB for a previously degraded one) is
-        // correct. clean_unmount=0 only triggers action in __init_bitmap_and_degraded_route when
-        // the route is already non-EITHER (degraded), which is already handled by the age branches
-        // above or the on-disk route value — not by anything we need to set here.
+        // Ages equal, clean_unmount differs. A *healthy* (route==EITHER) array only gets here via an
+        // asymmetric shutdown write (clean_unmount=1 landed on one leg only); equal ages then mean
+        // the legs are identical, so return the clean one and keep the on-disk route -- nothing to
+        // resync. For a *degraded* (route!=EITHER) array equal ages do NOT imply identical:
+        // degradation and self-heal write BOTH superblocks while the destination still resyncs; that
+        // divergence rides read_route + the superbitmap and is handled by
+        // __init_bitmap_and_degraded_route, not here.
         //
-        // NOTE FOR FUTURE ANALYSIS: do not add read_route assignment here. The temptation is to
-        // route to the clean device to "be safe", but equal ages make it unnecessary and it causes
-        // the array to open degraded and run a no-op resync on every asymmetric shutdown.
+        // NOTE FOR FUTURE ANALYSIS: do not add a read_route assignment here. Routing to the clean
+        // device "to be safe" opens a healthy array degraded and runs a no-op resync on every
+        // asymmetric shutdown.
         return dev_a->fields.clean_unmount ? dev_a : dev_b;
     }
 
@@ -69,7 +68,7 @@ static raid1::SuperBlock* read_superblock(ublk_disk& device) {
 }
 
 io_result write_superblock(ublk_disk& device, raid1::SuperBlock const* sb, bool device_b, raid1::read_route read_route,
-                           bool include_superbitmap) {
+                           bool include_superbitmap, raid1::resync_copy_mode mode) {
     auto const sb_size = sizeof(raid1::SuperBlock);
     DEBUG_ASSERT_EQ(0, sb_size % device.block_size(), "Device {} blocksize does not support alignment of [{}B]", device,
                     sb_size)
@@ -91,6 +90,7 @@ io_result write_superblock(ublk_disk& device, raid1::SuperBlock const* sb, bool 
         memcpy(&local, sb, offsetof(SuperBlock, superbitmap_reserved));
     local.fields.read_route = static_cast< uint8_t >(read_route);
     local.fields.device_b = device_b ? 1 : 0;
+    local.fields.bitmap.resync_mode = static_cast< uint8_t >(mode);
     auto iov = iovec{.iov_base = &local, .iov_len = sb_size};
     auto res = device.sync_iov(UBLK_IO_OP_WRITE, &iov, 1, 0UL);
     RLOGI("Wrote: {} to: {}", local, device)

@@ -25,7 +25,10 @@ TEST(Raid1Async, ReadDegradedDirtyActiveFailNoFallback) {
         .fields = {.clean_unmount = 0,
                    .read_route = static_cast< uint8_t >(ublkpp::raid1::read_route::DEVA),
                    .device_b = 0,
-                   .bitmap = {._reserved = {0x00}, .chunk_size = htobe32(32 * Ki), .age = htobe64(2)}},
+                   .bitmap = {.resync_mode = 0,
+                              ._reserved = {0x00},
+                              .chunk_size = htobe32(32 * Ki),
+                              .age = htobe64(2)}},
         .superbitmap_reserved = {0x00}};
 
     EXPECT_CALL(*disk_a, prepare(_, _)).Times(AnyNumber()).WillRepeatedly(Return(ublkpp::ublk_disk::prepare_result{}));

@@ -33,7 +33,7 @@ static const ublkpp::raid1::SuperBlock async_raid1_superblock = {
     .fields = {.clean_unmount = 1,
                .read_route = static_cast< uint8_t >(ublkpp::raid1::read_route::EITHER),
                .device_b = 0,
-               .bitmap = {._reserved = {0x00}, .chunk_size = htobe32(32 * Ki), .age = 0}},
+               .bitmap = {.resync_mode = 0, ._reserved = {0x00}, .chunk_size = htobe32(32 * Ki), .age = 0}},
     .superbitmap_reserved = {0x00}};
 
 struct AsyncRaid1Fixture : public ::testing::Test {

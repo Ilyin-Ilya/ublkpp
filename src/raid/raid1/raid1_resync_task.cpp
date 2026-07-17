@@ -1,7 +1,9 @@
 #include "raid1_resync_task.hpp"
 
+#include <cstring>
 #include <pthread.h>
 #include <sched.h>
+#include <isa-l/mem_routines.h>
 #include <ublksrv.h>
 #include <sisl/utility/thread_factory.hpp>
 
@@ -12,13 +14,14 @@
 namespace ublkpp::raid1 {
 
 Raid1ResyncTask::Raid1ResyncTask(std::shared_ptr< raid1::Bitmap >& bitmap, uint64_t offset, uint32_t io_size,
-                                 uint32_t max_io, uint32_t slot_count, uint32_t chunk_size,
-                                 std::shared_ptr< ublkpp::UblkRaidMetrics > metrics) :
+                                 uint32_t max_io, std::atomic< resync_copy_mode >* live_mode, uint32_t slot_count,
+                                 uint32_t chunk_size, std::shared_ptr< ublkpp::UblkRaidMetrics > metrics) :
         _dirty_bitmap(bitmap),
         _metrics(metrics),
         _io_size(io_size),
         _max_size(max_io),
         _offset(offset),
+        _live_mode(live_mode ? live_mode : &_owned_mode),
         _region_tracker(slot_count, chunk_size),
         _resync_task() {
     if (!_dirty_bitmap) throw std::runtime_error("No Bitmap");
@@ -75,6 +78,20 @@ void Raid1ResyncTask::_start(std::string str_uuid, std::shared_ptr< MirrorDevice
 
     // We are now guaranteed to be the only active thread performing I/O on the device
     if (resync_state::STOPPING != cur_state) {
+        // Return the resync FSM to IDLE before this thread can exit: only this thread ever leaves
+        // ACTIVE, so a lingering ACTIVE would make stop() spin forever. Today the state is always
+        // ACTIVE here (stop() only CAS-es SLEEPING/IDLE->STOPPING, never ACTIVE->STOPPING), but
+        // letting the CAS failure update `s` lets the loop converge from any state -- so it can never
+        // spin on a stale expected value, even if that invariant changes. Also handles spurious
+        // compare_exchange_weak failures (ARM/POWER LL/SC).
+        auto to_idle = [this] {
+            resync_state s = resync_state::ACTIVE;
+            while (!__cas_state(s, resync_state::IDLE)) {}
+        };
+
+        // Snapshot the live mode for the allocation decision and the log; __run re-reads it per copy.
+        auto const initial = _live_mode->load(std::memory_order_acquire);
+        RLOGI("Resync starting [uuid:{}] [mode:{}] to: {}", str_uuid, initial, *dirty_mirror->disk)
         auto const initial_resync_size = _dirty_bitmap->dirty_data_est();
         // Set ourselves up with a buffer to do all the read/write operations from
         auto iov = iovec{.iov_base = nullptr, .iov_len = 0};
@@ -82,8 +99,28 @@ void Raid1ResyncTask::_start(std::string str_uuid, std::shared_ptr< MirrorDevice
             [[unlikely]] { // LCOV_EXCL_START
             RLOGE("Could not allocate memory for I/O: {}", strerror(err))
             if (iov.iov_base) free(iov.iov_base);
+            to_idle();
             return;
         } // LCOV_EXCL_STOP
+
+        // Destination-compare buffer: CHECK reads the destination, and ZERO_TEST needs it ready for
+        // a mid-run downgrade to CHECK (see __run). On allocation failure fall back to BLIND rather
+        // than abort -- a blind copy still converges; aborting would leave the array dirty.
+        // blind_fallback pins this run to BLIND when no compare buffer is available (BLIND mode, or
+        // an allocation failure). It is run-local and is never published to _live_mode: a relaunch
+        // may allocate successfully and resume the real CHECK/ZERO_TEST.
+        auto cmp_iov = iovec{.iov_base = nullptr, .iov_len = 0};
+        bool blind_fallback = true;
+        if (resync_copy_mode::BLIND != initial) {
+            if (auto err = ::posix_memalign(&cmp_iov.iov_base, _io_size, _max_size);
+                0 != err || nullptr == cmp_iov.iov_base) [[unlikely]] { // LCOV_EXCL_START
+                RLOGW("Could not allocate compare memory ({}); resync falling back to BLIND copy", strerror(err))
+                cmp_iov.iov_base = nullptr; // posix_memalign leaves this null on failure; keep it so
+                // blind_fallback stays true
+            } // LCOV_EXCL_STOP
+            else
+                blind_fallback = false; // compare buffer ready -> honor the live CHECK/ZERO_TEST mode
+        }
 
         auto const resync_start = std::chrono::steady_clock::now();
         // Record resync start - increment global and per-device counters
@@ -107,7 +144,7 @@ void Raid1ResyncTask::_start(std::string str_uuid, std::shared_ptr< MirrorDevice
         // launch() wins the IDLE slot, that new task handles the remaining bits.
         while (true) {
             auto const pages_before = _dirty_bitmap->dirty_pages();
-            cur_state = __run(clean_mirror, dirty_mirror, &iov);
+            cur_state = __run(clean_mirror, dirty_mirror, &iov, cmp_iov.iov_base ? &cmp_iov : nullptr, blind_fallback);
             if (resync_state::STOPPING == cur_state) {
                 // All chunks cleared but stopped in __yield(): commit so destructor sees route=EITHER,
                 // not DEVA/DEVB + empty-superbitmap. Guard: pages_before>0 skips a zero bitmap at launch.
@@ -121,12 +158,9 @@ void Raid1ResyncTask::_start(std::string str_uuid, std::shared_ptr< MirrorDevice
             if (!complete()) continue;
             if (0 != _dirty_bitmap->dirty_pages()) continue;
 
-            // Attempt ACTIVE→IDLE; re-check for bits that landed in the transition gap.
-            // Loop to handle spurious compare_exchange_weak failures (ARM/POWER LL/SC).
-            // A spurious failure leaves state ACTIVE; breaking without the loop would
-            // cause _start() to return with state=ACTIVE and deadlock stop().
-            for (auto active = resync_state::ACTIVE; !__cas_state(active, resync_state::IDLE);)
-                active = resync_state::ACTIVE;
+            // Attempt ACTIVE->IDLE via to_idle (single implementation; handles spurious CAS
+            // failures), then re-check for bits that landed in the transition gap.
+            to_idle();
             if (0 == _dirty_bitmap->dirty_pages()) break; // clean exit
 
             // Bits appeared between the dirty_pages() check and the CAS. Try to reclaim
@@ -137,6 +171,7 @@ void Raid1ResyncTask::_start(std::string str_uuid, std::shared_ptr< MirrorDevice
             RLOGD("Resync re-entering after concurrent dirty_region [uuid:{}] to: {}", str_uuid, *dirty_mirror->disk)
         }
         free(iov.iov_base);
+        if (cmp_iov.iov_base) free(cmp_iov.iov_base);
 
         if (_metrics) { // GCOVR_EXCL_BR_LINE
             // LCOV_EXCL_START -- UblkRaidMetrics requires prometheus registry; not constructible in unit tests
@@ -226,20 +261,96 @@ void Raid1ResyncTask::__clean(uint64_t addr, uint32_t len, MirrorDevice& clean_m
     }
 }
 
-static inline io_result __copy_region(iovec* iovec, int nr_vecs, uint64_t addr, auto& src, auto& dest) {
-    auto res = src.sync_iov(UBLK_IO_OP_READ, iovec, nr_vecs, addr);
-    if (res) {
-        if (res = dest.sync_iov(UBLK_IO_OP_WRITE, iovec, nr_vecs, addr); !res) {
-            RLOGW("Could not write clean chunks of [sz:{}] [res:{}]", iovec_len(iovec, iovec + nr_vecs),
-                  res.error().message())
+// Copy the region [addr, addr+len) from src to dest per the copy mode:
+//   BLIND     - write the whole region unconditionally (destination known to diverge).
+//   CHECK     - read the destination into cmp_iov and memcmp per page; write only divergent pages.
+//               An explicit read+compare, correct for any backend. (Future: a backend-offloaded
+//               region digest could replace the destination read, with this as the fallback.)
+//   ZERO_TEST - destination asserted to read zero where unallocated: zero-detect each source page
+//               and write only non-zero pages, with no destination read (thin-preserving).
+// Non-blind modes decide at raid1::k_page_size (4 KiB), not the device block size: identical
+// skip/allocate decisions at identical offsets keep both legs' thin allocation maps (backend
+// B-trees) aligned, and with the source read at max_io and contiguous writes coalesced, the finer
+// grain only costs memcmp/zero-detect over resident memory.
+// Returns the source byte count on success -- including the all-skipped case, so the caller still
+// cleans the bitmap -- or the error on a write failure. A CHECK destination-read failure is not fatal:
+// it falls back to a BLIND write of the source (which may remap a media error), rather than looping.
+// The resync operates on one contiguous buffer, so nr_vecs is fixed at 1.
+static inline io_result __copy_region(iovec* src_iov, iovec* cmp_iov, uint64_t addr, auto& src, auto& dest,
+                                      resync_copy_mode mode) {
+    auto res = src.sync_iov(UBLK_IO_OP_READ, src_iov, 1, addr);
+    if (!res) {
+        RLOGE("Could not read Data of [sz:{}] [res:{}]", src_iov->iov_len, res.error().message())
+        return res;
+    }
+    auto const len = static_cast< uint32_t >(src_iov->iov_len);
+
+    // BLIND: one write of the whole region.
+    if (resync_copy_mode::BLIND == mode) {
+        if (auto w = dest.sync_iov(UBLK_IO_OP_WRITE, src_iov, 1, addr); !w) {
+            RLOGW("Could not write clean chunks of [sz:{}] [res:{}]", len, w.error().message())
+            return w;
         }
-    } else {
-        RLOGE("Could not read Data of [sz:{}] [res:{}]", iovec_len(iovec, iovec + nr_vecs), res.error().message())
+        return res;
+    }
+
+    // Non-BLIND always receives a buffer (an allocation failure downgrades to BLIND in _start).
+    DEBUG_ASSERT(cmp_iov, "cmp_iov must be provided for non-BLIND copy modes");
+
+    // CHECK: read the destination once so each page can be compared against it. A destination-read
+    // failure (a media/URE error) is NOT fatal: fall back to a BLIND write of the source. The write
+    // may relocate the failing block (homestore remaps a media error to a fresh LBA), healing the
+    // region; without this the read fails forever and the resync loops on the same LBA. A write
+    // failure IS a real device failure -- propagate it like any other write error.
+    if (resync_copy_mode::CHECK == mode) {
+        cmp_iov->iov_len = src_iov->iov_len;
+        if (auto cmp = dest.sync_iov(UBLK_IO_OP_READ, cmp_iov, 1, addr); !cmp) {
+            RLOGW("Could not read compare chunks of [sz:{}] [res:{}]; blind-writing the source", len,
+                  cmp.error().message())
+            if (auto w = dest.sync_iov(UBLK_IO_OP_WRITE, src_iov, 1, addr); !w) {
+                RLOGW("Could not write clean chunks of [sz:{}] [res:{}]", len, w.error().message())
+                return w;
+            }
+            return res;
+        }
+    }
+
+    auto* const src_buf = static_cast< uint8_t* >(src_iov->iov_base);
+
+    // Flush a coalesced run of to-write pages [run_start, run_end) as one write.
+    auto flush = [&](uint32_t run_start, uint32_t run_end) -> io_result {
+        auto w_iov = iovec{.iov_base = src_buf + run_start, .iov_len = run_end - run_start};
+        auto w = dest.sync_iov(UBLK_IO_OP_WRITE, &w_iov, 1, addr + run_start);
+        if (!w) RLOGW("Could not write clean pages of [sz:{}] [res:{}]", run_end - run_start, w.error().message())
+        return w;
+    };
+
+    uint32_t run_start = 0;
+    bool in_run = false;
+    for (uint32_t off = 0; off < len; off += k_page_size) {
+        auto const this_page = std::min< uint32_t >(k_page_size, len - off);
+        // skip: page identical to the destination (CHECK) or all-zero onto a clean one (ZERO_TEST).
+        bool const skip = (resync_copy_mode::CHECK == mode)
+            ? (0 == memcmp(src_buf + off, static_cast< uint8_t const* >(cmp_iov->iov_base) + off, this_page))
+            : (0 == isal_zero_detect(src_buf + off, this_page));
+        if (skip) {
+            if (in_run) {
+                if (auto f = flush(run_start, off); !f) return f;
+                in_run = false;
+            }
+        } else if (!in_run) {
+            run_start = off;
+            in_run = true;
+        }
+    }
+    if (in_run) {
+        if (auto f = flush(run_start, len); !f) return f;
     }
     return res;
 }
 
-resync_state Raid1ResyncTask::__run(auto& clean_mirror, auto& dirty_mirror, iovec* iov) noexcept {
+resync_state Raid1ResyncTask::__run(auto& clean_mirror, auto& dirty_mirror, iovec* iov, iovec* cmp_iov,
+                                    bool blind_fallback) noexcept {
     static auto const unavail_delay = std::chrono::seconds(SISL_OPTIONS["avail_delay"].as< uint32_t >());
     static auto const avail_delay = std::chrono::microseconds(SISL_OPTIONS["resync_delay"].as< uint32_t >());
 
@@ -306,8 +417,13 @@ resync_state Raid1ResyncTask::__run(auto& clean_mirror, auto& dirty_mirror, iove
                 continue;
             }
 
+            // Re-read the live mode per copy so an I/O-path re-dirty (or this run's own earlier
+            // downgrade) takes effect immediately. blind_fallback pins BLIND when no compare buffer
+            // was allocated.
+            auto const eff = blind_fallback ? resync_copy_mode::BLIND : _live_mode->load(std::memory_order_acquire);
             iov->iov_len = iov_len; // Copy Region from clean to dirty
-            if (auto res = __copy_region(iov, 1, logical_off + _offset, *clean_mirror->disk, *dirty_mirror->disk);
+            if (auto res =
+                    __copy_region(iov, cmp_iov, logical_off + _offset, *clean_mirror->disk, *dirty_mirror->disk, eff);
                 res) {
                 // Phase 2: post-copy conflict check. Two cases require skipping __clean:
                 //   (a) overlaps() — write is still in-flight (single CAS slot still holds
@@ -318,6 +434,16 @@ resync_state Raid1ResyncTask::__run(auto& clean_mirror, auto& dirty_mirror, iove
                     !_region_tracker.completed_since(logical_off, iov_len, gen_before)) {
                     __clean(logical_off, iov->iov_len, *clean_mirror);
                     if (_metrics) { _metrics->record_resync_progress(iov->iov_len); } // GCOVR_EXCL_BR_LINE
+                } else if (resync_copy_mode::ZERO_TEST == eff) {
+                    // A write raced this copy; if it zeroes the source in place, a zero-detect
+                    // re-sync would skip the region and leave stale destination data we already
+                    // wrote. Publish ZERO_TEST -> CHECK through _live_mode (cmp_iov is pre-allocated) so
+                    // the rest of the run reads-and-compares, and the downgrade persists across a
+                    // stop/relaunch. Monotonic CAS: a no-op if a concurrent re-dirty already tainted it.
+                    RLOGI("Resync downgrading ZERO_TEST -> CHECK after a write conflict to: {}", *dirty_mirror->disk)
+                    auto exp = resync_copy_mode::ZERO_TEST;
+                    _live_mode->compare_exchange_strong(exp, resync_copy_mode::CHECK, std::memory_order_acq_rel,
+                                                        std::memory_order_relaxed);
                 }
                 any_copy = true;
                 --copies_left;

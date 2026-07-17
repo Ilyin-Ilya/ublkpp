@@ -16,6 +16,7 @@
   local devices — with a RAID1-cost **"skinny" mode** (two data replicas + a quorum arbiter) on the way.
 - **RAID Support**: RAID0 (striping), RAID1 (mirroring), and RAID10 (stripe of mirrors)
 - **RAID1 Resilient Bitmap**: Memory-efficient dirty tracking (4 KiB page tracks 1 GiB data)
+- **Thin-Aware, Resumable Resync**: Per-scenario copy modes (blind / compare-skip / zero-detect) persisted in the superblock; a cleanly-stopped resync resumes where it left off
 - **Hot Device Replacement**: Swap devices in degraded RAID1 arrays without downtime
 - **Lock-Free I/O Path**: Read/write operations use lock-free algorithms (x86-64/ARM64)
 - **Factory-Based API**: Replicated volumes, file-backed disks, and RAID compositions through supported factory functions
@@ -145,7 +146,7 @@ what makes CraftDisk a drop-in RAID1 replacement: the same storage cost, with re
 - Two-way mirroring with dirty bitmap tracking
 - Degraded mode operation (single device failure)
 - Hot device replacement via `swap_device()`
-- Read routing round-robbins
+- Read routing round-robins
 
 **Bitmap Efficiency:**
 - 4 KiB pages track 32 KiB chunks (default)
@@ -156,7 +157,19 @@ what makes CraftDisk a drop-in RAID1 replacement: the same storage cost, with re
 - Background resync with per-region I/O coordination
 - Lock-free write tracking: resync yields only for chunks that conflict with an in-flight write
 - Two-phase conflict check with shadow completion log to close the mid-copy race window
+- Copy mode selected by recovery scenario, deciding per 4 KiB page:
+  - **BLIND**: full copy -- known-divergent dirty sets (a degraded leg's outage writes) and unverified fresh legs
+  - **CHECK**: read + `memcmp` the destination, rewrite only divergent pages -- power-loss self-heal, re-added legs
+  - **ZERO_TEST**: zero-detect the source, skip unallocated regions with no destination read -- fresh-leg rebuilds on thin devices (requires `assume_clean`)
+- Mode persists in the superblock: a cleanly-stopped resync resumes where it left off; an unclean stop falls back to a full CHECK pass
+- New arrays run an md-style initial sync unless constructed with `assume_clean` (see below)
 - Configurable delay intervals
+
+**`assume_clean` (per-device opt-in on `make_raid1_disk()` / `swap_device()`, `--assume_clean` on the example):**
+asserts a genuinely-fresh leg (no superblock) reads back zero for never-written blocks, e.g. a
+newly-provisioned thin volume or sparse file. Enables ZERO_TEST rebuilds and skips the new-array
+initial sync (both legs already read identically), preserving thin provisioning. Leave unset for
+recycled/raw disks -- the initial sync then makes the mirrors read deterministically.
 
 ### RAID10 (Stripe of Mirrors)
 
@@ -183,8 +196,8 @@ fallocate -l 2G file2.dat
 fallocate -l 2G file3.dat
 fallocate -l 2G file4.dat
 
-# Launch RAID10 device
-sudo ublkpp/build/Release/example/ublkpp_disk --raid10 file1.dat,file2.dat,file3.dat,file4.dat
+# Launch RAID10 device (sparse files read zero: --assume_clean skips the new-array initial sync)
+sudo ublkpp/build/Release/example/ublkpp_disk --raid10 file1.dat,file2.dat,file3.dat,file4.dat --assume_clean
 ```
 
 ### Usage Examples
@@ -200,11 +213,11 @@ sudo ublkpp_disk --loop /dev/sdb
 # RAID0 (striping)
 sudo ublkpp_disk --raid0 /dev/sdc,/dev/sdd --stripe_size 262144
 
-# RAID1 (mirroring)
+# RAID1 (mirroring; a brand-new array runs an initial sync to make the mirrors identical)
 sudo ublkpp_disk --raid1 /dev/sde,/dev/sdf
 
-# RAID10 (4+ devices)
-sudo ublkpp_disk --raid10 file1.dat,file2.dat,file3.dat,file4.dat
+# RAID10 (4+ devices; sparse/thin backing reads zero, so skip the initial sync)
+sudo ublkpp_disk --raid10 file1.dat,file2.dat,file3.dat,file4.dat --assume_clean
 
 # Recover existing device
 sudo ublkpp_disk --device_id 0 --raid1 /dev/sde,/dev/sdf

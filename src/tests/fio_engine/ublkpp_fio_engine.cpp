@@ -285,8 +285,9 @@ static int ublkpp_init(struct thread_data* td) {
                 log_err("ublkpp_fio: raid1 requires 2 disk_files\n");
                 return -1;
             }
+            // Sparse test images read zero where unallocated: assume_clean skips the initial sync.
             disk = ublkpp::make_raid1_disk(uuid_for_paths(paths), ublkpp::make_fs_disk(paths[0]),
-                                           ublkpp::make_fs_disk(paths[1]));
+                                           ublkpp::make_fs_disk(paths[1]), "", true);
         } else if (type == "raid10") {
             if (paths.size() != 4) {
                 log_err("ublkpp_fio: raid10 requires exactly 4 disk_files\n");
@@ -296,9 +297,9 @@ static int ublkpp_init(struct thread_data* td) {
             std::vector< std::string > const pair_a_paths{paths[0], paths[1]};
             std::vector< std::string > const pair_b_paths{paths[2], paths[3]};
             auto pair_a = ublkpp::make_raid1_disk(uuid_for_paths(pair_a_paths), ublkpp::make_fs_disk(paths[0]),
-                                                  ublkpp::make_fs_disk(paths[1]));
+                                                  ublkpp::make_fs_disk(paths[1]), "", true);
             auto pair_b = ublkpp::make_raid1_disk(uuid_for_paths(pair_b_paths), ublkpp::make_fs_disk(paths[2]),
-                                                  ublkpp::make_fs_disk(paths[3]));
+                                                  ublkpp::make_fs_disk(paths[3]), "", true);
             std::vector< std::shared_ptr< ublkpp::ublk_disk > > members{std::move(pair_a), std::move(pair_b)};
             disk = ublkpp::make_raid0_disk(uuid_for_paths(paths), chunk_size, std::move(members));
         } else {

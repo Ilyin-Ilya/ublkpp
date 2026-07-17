@@ -224,8 +224,24 @@ TEST(Raid1, UncleanShutdownBothPresentSelfHeal) {
             EXPECT_EQ(ublkpp::raid1::read_route::DEVA, static_cast< ublkpp::raid1::read_route >(sb->fields.read_route));
             return ublkpp::raid1::k_page_size;
         });
-    // device_b: no writes — __become_active skips (unavail guard), destructor skips (degraded backup)
-    EXPECT_CALL(*device_b, sync_iov(UBLK_IO_OP_WRITE, _, _, _)).Times(0);
+    // device_b: __become_active now writes the backup SB too (ages equalize; the freeze is gone).
+    // The destructor still skips it (degraded backup). The backup carries device_b=1, route=DEVA,
+    // age 16, clean_unmount=0, and the persisted resync_mode=CHECK so an interrupted self-heal
+    // resumes as CHECK via the degraded-return branch.
+    EXPECT_CALL(*device_b, sync_iov(UBLK_IO_OP_WRITE, _, _, _))
+        .Times(1)
+        .WillOnce([](uint8_t, iovec* iovecs, uint32_t nr_vecs, off_t addr) -> io_result {
+            EXPECT_EQ(1U, nr_vecs);
+            EXPECT_EQ(ublkpp::raid1::k_page_size, ublkpp::iovec_len(iovecs, iovecs + nr_vecs));
+            EXPECT_EQ(0UL, addr);
+            auto* sb = reinterpret_cast< ublkpp::raid1::SuperBlock* >(iovecs->iov_base);
+            EXPECT_EQ(1, sb->fields.device_b);
+            EXPECT_EQ(ublkpp::raid1::read_route::DEVA, static_cast< ublkpp::raid1::read_route >(sb->fields.read_route));
+            EXPECT_EQ(htobe64(16), sb->fields.bitmap.age);
+            EXPECT_EQ(0, sb->fields.clean_unmount);
+            EXPECT_EQ(static_cast< uint8_t >(ublkpp::raid1::resync_copy_mode::CHECK), sb->fields.bitmap.resync_mode);
+            return ublkpp::raid1::k_page_size;
+        });
 
     auto raid_device = ublkpp::raid1::Raid1Disk(boost::uuids::string_generator()(test_uuid), device_a, device_b);
 
@@ -284,7 +300,10 @@ TEST(Raid1, UncleanBothPresentSelfHealIdempotentAfterCrash) {
             sb->fields.bitmap.age = htobe64(16);
             return ublkpp::raid1::k_page_size;
         });
-    // device_b: stale SB, age=0, route=EITHER (was never written during first self-heal)
+    // device_b: a leg from an earlier epoch (age=0 vs device_a's 16). Post freeze-drop, __become_active
+    // writes BOTH legs' SBs to equal ages, so a crashed self-heal no longer leaves a stale age here;
+    // this models a long-detached leg reattaching. The >1 age gap promotes it to new_device -> full
+    // rebuild (the "idempotent" property: a re-run self-heal still rebuilds it).
     EXPECT_CALL(*device_b, sync_iov(UBLK_IO_OP_READ, _, _, _))
         .Times(1)
         .WillOnce([](uint8_t, iovec* iovecs, uint32_t, off_t) -> io_result {
@@ -568,4 +587,177 @@ TEST(Raid1, ZeroResyncLevelThrows) {
     auto device_b = std::make_shared< ublkpp::TestDisk >(TestParams{.capacity = Gi});
     EXPECT_THROW(ublkpp::raid1::Raid1Disk(boost::uuids::string_generator()(test_uuid), device_a, device_b),
                  std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Recovery-mode resume (Part A): a reassembled degraded array selects its resync mode from the
+// persisted superblock byte -- resume as-is on a clean stop, force CHECK on an unclean crash.
+// ---------------------------------------------------------------------------------------------
+
+// One leg of a degraded (route=DEVA) array: its SB read returns route DEVA with the given
+// clean_unmount / slot / age / persisted resync_mode. All writes (SB rewrites + destructor flush)
+// are accepted.
+static std::shared_ptr< ublkpp::TestDisk >
+make_degraded_leg(bool slot_b, uint8_t clean_unmount, uint64_t age, ublkpp::raid1::resync_copy_mode mode,
+                  ublkpp::raid1::read_route route = ublkpp::raid1::read_route::DEVA,
+                  std::shared_ptr< ublkpp::raid1::SuperBlock > captured = nullptr) {
+    auto d = std::make_shared< ublkpp::TestDisk >(TestParams{.capacity = Gi, .is_slot_b = slot_b});
+    EXPECT_CALL(*d, sync_iov(_, _, _, _))
+        .Times(::testing::AnyNumber())
+        .WillRepeatedly([slot_b, clean_unmount, age, mode, route, captured](uint8_t op, iovec* iov, uint32_t,
+                                                                            off_t addr) -> io_result {
+            if (op == UBLK_IO_OP_READ && 0 == addr && iov->iov_base) {
+                memcpy(iov->iov_base, &normal_superblock, ublkpp::raid1::k_page_size);
+                auto* sb = static_cast< ublkpp::raid1::SuperBlock* >(iov->iov_base);
+                sb->fields.read_route = static_cast< uint8_t >(route);
+                sb->fields.clean_unmount = clean_unmount;
+                sb->fields.device_b = slot_b ? 1 : 0;
+                sb->fields.bitmap.age = htobe64(age);
+                sb->fields.bitmap.resync_mode = static_cast< uint8_t >(mode);
+            } else if (op == UBLK_IO_OP_WRITE && 0 == addr && iov->iov_base && captured) {
+                memcpy(captured.get(), iov->iov_base, sizeof(ublkpp::raid1::SuperBlock));
+            }
+            return static_cast< int >(iov->iov_len);
+        });
+    return d;
+}
+
+// Assemble a degraded array (Side-A canonical, equal ages) and return the selected resync mode. A
+// clean stop leaves the canonical clean_unmount=1 and the backup 0 (destructor writes only the
+// active leg); an unclean crash leaves both 0.
+static ublkpp::raid1::resync_copy_mode recovered_mode(bool clean, ublkpp::raid1::resync_copy_mode persisted) {
+    auto a = make_degraded_leg(false, clean ? 1 : 0, 5, persisted);
+    auto b = make_degraded_leg(true, 0, 5, persisted);
+    ublkpp::raid1::Raid1Disk raid(boost::uuids::string_generator()(test_uuid), a, b);
+    raid.toggle_resync(false);
+    return raid.current_resync_mode();
+}
+
+// Clean degraded stop -> resume the persisted mode as-is (branch 4).
+TEST(Raid1RecoveryMode, CleanDegradedResumesPersistedMode) {
+    using RM = ublkpp::raid1::resync_copy_mode;
+    EXPECT_EQ(RM::BLIND, recovered_mode(true, RM::BLIND));         // known-divergent degradation stays BLIND (cheaper)
+    EXPECT_EQ(RM::CHECK, recovered_mode(true, RM::CHECK));         // power-loss self-heal stays CHECK
+    EXPECT_EQ(RM::ZERO_TEST, recovered_mode(true, RM::ZERO_TEST)); // interrupted fresh-leg thin rebuild continues
+}
+
+// Unclean crash of a degraded array -> dirty-all the whole (mostly-matching) array in CHECK
+// whatever was persisted; ZERO_TEST also cannot safely cross a crash (branch 3).
+TEST(Raid1RecoveryMode, UncleanDegradedForcesCheck) {
+    using RM = ublkpp::raid1::resync_copy_mode;
+    EXPECT_EQ(RM::CHECK, recovered_mode(false, RM::BLIND));
+    EXPECT_EQ(RM::CHECK, recovered_mode(false, RM::CHECK));
+    EXPECT_EQ(RM::CHECK, recovered_mode(false, RM::ZERO_TEST));
+}
+
+// A legacy superblock has the resync_mode byte zeroed (== BLIND): a clean degraded reassembly
+// reproduces today's BLIND behavior.
+TEST(Raid1RecoveryMode, LegacySbResumesBlind) {
+    using RM = ublkpp::raid1::resync_copy_mode;
+    EXPECT_EQ(RM::BLIND, recovered_mode(true, RM::BLIND)); // BLIND == 0 == legacy zeroed byte
+}
+
+// A live re-dirty during a ZERO_TEST rebuild must taint the persisted/live mode to CHECK (review
+// finding 1): once the target leg has taken a write there, it may hold non-zero data where the
+// source now reads zero, and a ZERO_TEST re-copy would zero-skip it and leave the mirrors divergent.
+// A write to a CLEAN region replicates to both legs; the target's data write fails, routing through
+// Site 3, which untaints ZERO_TEST -> CHECK before dirtying the region.
+TEST(Raid1RecoveryMode, LiveReDirtyUntaintsZeroTest) {
+    using RM = ublkpp::raid1::resync_copy_mode;
+    // Clean degraded array (route DEVA, empty superbitmap) resuming a persisted ZERO_TEST rebuild.
+    auto a = make_degraded_leg(false, 1, 5, RM::ZERO_TEST); // canonical source, clean
+    auto b = make_degraded_leg(true, 0, 5, RM::ZERO_TEST);  // rebuild target (backup)
+    ublkpp::raid1::Raid1Disk raid(boost::uuids::string_generator()(test_uuid), a, b);
+    raid.toggle_resync(false); // freeze the resync; we drive the write and inspect the mode directly
+
+    ASSERT_EQ(RM::ZERO_TEST, raid.current_resync_mode());
+    ASSERT_EQ(0u, raid.replica_states().bytes_to_sync) << "empty superbitmap -> every region clean";
+
+    // Fail only the target leg's DATA write (offset >= reserved_size); its SB writes still succeed.
+    EXPECT_CALL(*b, sync_iov(UBLK_IO_OP_WRITE, _, _, ::testing::Ge(static_cast< off_t >(raid.reserved_size()))))
+        .Times(::testing::AnyNumber())
+        .WillRepeatedly([](uint8_t, iovec*, uint32_t, off_t) -> io_result {
+            return std::unexpected(std::make_error_condition(std::errc::io_error));
+        });
+
+    // Write to a clean region: it replicates to both legs; the target write fails -> Site 3.
+    iovec iov{nullptr, 4 * Ki};
+    auto const res = raid.sync_iov(UBLK_IO_OP_WRITE, &iov, 1, 0);
+    ASSERT_TRUE(res) << "the source (active) write succeeds, so the op is acked";
+
+    EXPECT_EQ(RM::CHECK, raid.current_resync_mode()) << "Site-3 re-dirty must taint ZERO_TEST -> CHECK";
+    EXPECT_GT(raid.replica_states().bytes_to_sync, 0u) << "the failed region must be re-dirtied";
+}
+
+// ---------------------------------------------------------------------------------------------
+// Missing-leg epoch ordering: constructing with a missing leg from a previously-healthy (EITHER)
+// superblock must advance the age, or the absent leg ties arbitration when reattached and the
+// array opens healthy over stale data. Clean pull -> +1 (reattach resumes); healthy-crash ->
+// +k_age_bump (reattach fully rebuilds); already-degraded restart -> no re-bump.
+// ---------------------------------------------------------------------------------------------
+
+// Live leg (slot B) with a crafted SB; every SB write is captured for inspection.
+static uint64_t missing_start_age(ublkpp::raid1::read_route route, uint8_t clean_unmount, uint64_t age) {
+    auto captured = std::make_shared< ublkpp::raid1::SuperBlock >();
+    auto leg = make_degraded_leg(true, clean_unmount, age, ublkpp::raid1::resync_copy_mode::BLIND, route, captured);
+    { ublkpp::raid1::Raid1Disk raid(boost::uuids::string_generator()(test_uuid), ublkpp::make_missing_disk(), leg); }
+    EXPECT_EQ(1, captured->fields.clean_unmount); // destructor persisted a clean stop
+    return be64toh(captured->fields.bitmap.age);
+}
+
+TEST(Raid1MissingLegEpoch, CleanPullBumpsByOne) {
+    EXPECT_EQ(6u, missing_start_age(ublkpp::raid1::read_route::EITHER, 1, 5));
+}
+
+TEST(Raid1MissingLegEpoch, HealthyCrashFencesEpoch) {
+    EXPECT_EQ(21u, missing_start_age(ublkpp::raid1::read_route::EITHER, 0, 5)); // 5 + k_age_bump
+}
+
+TEST(Raid1MissingLegEpoch, DegradedRestartDoesNotRebump) {
+    EXPECT_EQ(6u, missing_start_age(ublkpp::raid1::read_route::DEVB, 1, 6));
+}
+
+// Reattach after a clean pull (survivor one ahead): the survivor's SB wins arbitration (persisted
+// mode consumed) and the stale leg resumes as a target -- no promotion, no dirty-all.
+TEST(Raid1MissingLegEpoch, ReattachAfterCleanPullResumes) {
+    using RM = ublkpp::raid1::resync_copy_mode;
+    auto a = make_degraded_leg(false, 1, 5, RM::BLIND, ublkpp::raid1::read_route::EITHER); // pulled leg
+    auto b = make_degraded_leg(true, 1, 6, RM::CHECK, ublkpp::raid1::read_route::DEVB);    // survivor
+    ublkpp::raid1::Raid1Disk raid(boost::uuids::string_generator()(test_uuid), a, b);
+    raid.toggle_resync(false);
+    EXPECT_EQ(RM::CHECK, raid.current_resync_mode()) << "survivor's SB must win arbitration";
+    EXPECT_EQ(0u, raid.replica_states().bytes_to_sync) << "resume from superbitmap, not dirty-all";
+}
+
+// Reattach after a healthy-crash fence (survivor k_age_bump ahead): the stale leg is promoted and
+// fully rebuilt.
+TEST(Raid1MissingLegEpoch, ReattachAfterCrashFenceRebuilds) {
+    using RM = ublkpp::raid1::resync_copy_mode;
+    auto a = make_degraded_leg(false, 0, 5, RM::BLIND, ublkpp::raid1::read_route::EITHER);
+    auto b = make_degraded_leg(true, 1, 21, RM::CHECK, ublkpp::raid1::read_route::DEVB);
+    ublkpp::raid1::Raid1Disk raid(boost::uuids::string_generator()(test_uuid), a, b);
+    raid.toggle_resync(false);
+    EXPECT_EQ(RM::CHECK, raid.current_resync_mode());
+    EXPECT_GT(raid.replica_states().bytes_to_sync, Gi / 2) << "promoted stale leg must dirty-all";
+}
+
+// Unclean shutdown while already degraded (route stored, clean_unmount=0) with the backup leg still
+// absent at restart -- the common post-crash recovery shape. The superbitmap cannot be trusted across
+// an unclean degraded crash, so the surviving leg dirty-alls the whole array and fences the epoch
+// (+k_age_bump) so a reattached leg fully rebuilds. The persisted mode is deliberately NOT resumed
+// here: with no target present no resync runs, and the reattach (promoted) path re-derives the mode.
+TEST(Raid1MissingLegEpoch, UncleanDegradedMissingLegDirtyAlls) {
+    using RM = ublkpp::raid1::resync_copy_mode;
+    auto captured = std::make_shared< ublkpp::raid1::SuperBlock >();
+    // Live leg is device_b (route DEVB, canonical); device_a is absent. Persisted mode is CHECK.
+    auto leg = make_degraded_leg(true, 0, 5, RM::CHECK, ublkpp::raid1::read_route::DEVB, captured);
+    {
+        ublkpp::raid1::Raid1Disk raid(boost::uuids::string_generator()(test_uuid), ublkpp::make_missing_disk(), leg);
+        raid.toggle_resync(false);
+        EXPECT_GT(raid.replica_states().bytes_to_sync, Gi / 2) << "superbitmap untrusted -> dirty-all";
+        EXPECT_EQ(RM::BLIND, raid.current_resync_mode())
+            << "persisted mode not resumed with the target absent; reattach re-derives it";
+    }
+    EXPECT_EQ(1, captured->fields.clean_unmount) << "destructor persisted a clean stop";
+    EXPECT_EQ(21u, be64toh(captured->fields.bitmap.age)) << "epoch fenced by k_age_bump (5 + 16)";
 }

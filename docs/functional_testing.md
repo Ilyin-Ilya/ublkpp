@@ -121,9 +121,10 @@ each mirror pair.
 3. Constructs the requested disk type:
    - **`fsdisk`** — `make_fs_disk(path)`
    - **`raid0`** — `make_raid0_disk(uuid, chunk_size, [make_fs_disk(...)...])`
-   - **`raid1`** — `make_raid1_disk(uuid, make_fs_disk(a), make_fs_disk(b))`
+   - **`raid1`** — `make_raid1_disk(uuid, make_fs_disk(a), make_fs_disk(b), "", true)`; `assume_clean`
+     is passed because the sparse backing images read zero, skipping the new-array initial sync
    - **`raid10`** — `make_raid0_disk(uuid, chunk_size, [raid1_pair_a, raid1_pair_b])` (two RAID1 pairs
-     striped together)
+     striped together, likewise `assume_clean`)
 4. Wraps the disk in `MockUblksrv` (io_uring SQE/CQE loop, no kernel module).
 5. Allocates a tag array (size = `iodepth`) for in-flight I/O tracking.
 

@@ -21,9 +21,19 @@ disk_handle make_raid0_disk(boost::uuids::uuid const& uuid, uint32_t stripe_size
 
 // Construct a 2-way RAID1 mirror from `dev_a` + `dev_b`. `parent_id` is woven into the metrics
 // labels; pass empty if metrics correlation is not needed.
+// `assume_clean`: assert only that a genuinely fresh leg (no superblock) reads back zero for
+// never-written blocks (e.g. a newly-provisioned thin volume): its rebuild then zero-detects the
+// source and skips all-zero regions (ZERO_TEST) instead of blind-copying, and a brand-new pair
+// (neither leg has a superblock) skips the md-style initial BLIND sync entirely (both legs already
+// read identically). It never affects the compare-vs-blind choice -- a leg that still holds data
+// always rebuilds in CHECK. Construction only; swap_device() takes its own. Leave false unless the
+// device guarantees read-zero-when-unallocated. Like mdadm's --assume-clean, this is an unchecked
+// operator assertion: if the device does not actually read zero where unallocated, ZERO_TEST skips
+// non-zero destination extents and the legs diverge silently and permanently (undetectable until the
+// surviving leg is needed).
 // Throws std::runtime_error on bad geometry / superblock probe failure.
 disk_handle make_raid1_disk(boost::uuids::uuid const& uuid, disk_handle dev_a, disk_handle dev_b,
-                            std::string const& parent_id = "");
+                            std::string const& parent_id = "", bool assume_clean = false);
 
 // Construct a placeholder disk representing a missing mirror leg. All I/O fails; is_missing()
 // returns true. Pass to make_raid1_disk() when a leg is unavailable and awaiting hot-swap.
@@ -53,7 +63,11 @@ struct array_state {
 // returns the displaced leg. On rejection (no matching id, geometry mismatch, would-degrade-
 // active-leg, etc.) returns `new_device` unchanged so the caller can identify rejection by
 // pointer-equality. Aborts if `disk` is not a Raid1 mirror (programmer error).
-disk_handle swap_device(ublk_disk& disk, std::string const& old_device_id, disk_handle new_device);
+// `assume_clean`: as on make_raid1_disk() -- assert `new_device` reads zero where unallocated so a
+// genuinely-fresh rebuild runs ZERO_TEST instead of a blind copy. Same unchecked-operator-assertion
+// caveat: a device that does not actually read zero where unallocated diverges the legs silently.
+disk_handle swap_device(ublk_disk& disk, std::string const& old_device_id, disk_handle new_device,
+                        bool assume_clean = false);
 
 // Returns the per-leg replica state + bytes-to-sync. If `disk` is not a Raid1 mirror, returns
 // the default-constructed value (see array_state).

@@ -96,7 +96,9 @@ TEST(Raid1, NewArrayWritesV2Superblock) {
             return ublkpp::raid1::k_page_size;
         });
 
-    auto raid_device = ublkpp::raid1::Raid1Disk(boost::uuids::string_generator()(test_uuid), device_a, device_b);
+    // assume_clean skips the new-array initial sync; this test asserts version stamping only.
+    auto raid_device =
+        ublkpp::raid1::Raid1Disk(boost::uuids::string_generator()(test_uuid), device_a, device_b, "", true);
     // Destructor writes clean_unmount=1 SB to both devices.
     EXPECT_TO_WRITE_SB(device_a);
     EXPECT_TO_WRITE_SB(device_b);

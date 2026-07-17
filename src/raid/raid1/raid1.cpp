@@ -31,9 +31,20 @@ namespace raid1 {
 
 // Min page-resolution (how much does the smallest page cover?)
 constexpr auto k_min_page_depth = k_min_chunk_size * k_page_size * k_bits_in_byte; // 1GiB from above
-// > 1: new_device detection threshold in __load_and_select_superblock. 16: matches the bumps used
-// in __swap_device and the existing new_device / unclean-degraded paths so all sites are comparable.
+// The age is a divergence-epoch counter with two deliberate bump tiers around the > 1 new_device
+// promotion threshold: +1 = same-epoch ordering (wins arbitration; peer resumes as a bitmap-covered
+// resync target), +k_age_bump = new-epoch fence (peer must fully rebuild on return). Do NOT
+// "normalize" the +1 sites to k_age_bump: that turns every runtime degradation into a full rebuild.
 constexpr uint64_t k_age_bump = 16;
+
+// Rebuild mode for a new/replacement leg: one with a superblock still holds real/stale data ->
+// CHECK (compare, write only divergent pages); a genuinely-fresh leg -> ZERO_TEST when the caller
+// asserted it reads zero where unallocated (assume_clean), else a blind full copy. assume_clean
+// never affects the CHECK decision.
+static constexpr resync_copy_mode rebuild_mode(bool sb_was_fresh, bool assume_clean) {
+    return !sb_was_fresh ? resync_copy_mode::CHECK
+                         : (assume_clean ? resync_copy_mode::ZERO_TEST : resync_copy_mode::BLIND);
+}
 
 // Max user-data size
 constexpr uint64_t k_max_user_data =
@@ -58,7 +69,8 @@ MirrorDevice::MirrorDevice(boost::uuids::uuid const& uuid, std::shared_ptr< ublk
     if (!read_super) {
         throw std::runtime_error(fmt::format("Could not read superblock! {}", read_super.error().message()));
     } else {
-        new_device = read_super.value().second;
+        // sb_was_fresh: genuine no-superblock truth, immune to later age-gap promotion of new_device.
+        sb_was_fresh = new_device = read_super.value().second;
         sb = std::shared_ptr< SuperBlock >(read_super.value().first, [](void* x) { free(x); });
     }
 }
@@ -84,7 +96,7 @@ struct RouteState {
 };
 
 Raid1Disk::Raid1Disk(boost::uuids::uuid const& uuid, std::shared_ptr< ublk_disk > dev_a,
-                     std::shared_ptr< ublk_disk > dev_b, std::string const& parent_id) :
+                     std::shared_ptr< ublk_disk > dev_b, std::string const& parent_id, bool assume_clean) :
         ublk_disk(), _uuid(uuid), _str_uuid(boost::uuids::to_string(uuid)) {
     // At least one device has to be "real"
     if (dev_a->is_missing() && dev_b->is_missing())
@@ -100,15 +112,15 @@ Raid1Disk::Raid1Disk(boost::uuids::uuid const& uuid, std::shared_ptr< ublk_disk 
     __init_params();
 
     // Initialize bitmap and handle initial degradation based on route determination
-    __init_bitmap_and_degraded_route();
+    __init_bitmap_and_degraded_route(assume_clean);
 
     // Initialize resync_task; slot_count = 2×qdepth so the tracker can hold every
     // in-flight write at peak depth. Fall back to 256 (= 2×128 default) when the
     // ublkpp_tgt option group is not loaded (unit test context).
     uint32_t const resync_slots = SISL_OPTIONS.count("qdepth") ? 2u * SISL_OPTIONS["qdepth"].as< uint16_t >() : 256u;
-    _resync_task = std::make_shared< Raid1ResyncTask >(_dirty_bitmap, _reserved_size, block_size(),
-                                                       params()->basic.max_sectors << SECTOR_SHIFT, resync_slots,
-                                                       be32toh(_sb->fields.bitmap.chunk_size), _raid_metrics);
+    _resync_task = std::make_shared< Raid1ResyncTask >(
+        _dirty_bitmap, _reserved_size, block_size(), params()->basic.max_sectors << SECTOR_SHIFT, &_resync_mode,
+        resync_slots, be32toh(_sb->fields.bitmap.chunk_size), _raid_metrics);
 
     // Write the up-to-date superblocks and mark devices as in use
     __become_active();
@@ -219,7 +231,7 @@ void Raid1Disk::__load_and_select_superblock(boost::uuids::uuid const& uuid, std
     if (_device_a->new_device && _device_b->new_device) _sb->fields.bitmap.age = htobe64(1);
 }
 
-void Raid1Disk::__init_bitmap_and_degraded_route() {
+void Raid1Disk::__init_bitmap_and_degraded_route(bool assume_clean) {
     // Read in existing dirty BITMAP pages
     _dirty_bitmap = std::make_shared< Bitmap >(capacity(), be32toh(_sb->fields.bitmap.chunk_size), block_size(),
                                                _sb->superbitmap_reserved, _str_uuid);
@@ -240,10 +252,17 @@ void Raid1Disk::__init_bitmap_and_degraded_route() {
         // previously healthy with unclean shutdown), the superbitmap is trustworthy: load it and
         // let load_from skip pages that are already clean.
         if (!_sb->fields.clean_unmount && static_cast< read_route >(_sb->fields.read_route) != read_route::EITHER) {
-            _sb->fields.bitmap.age = htobe64(be64toh(_sb->fields.bitmap.age) + 16);
+            _sb->fields.bitmap.age = htobe64(be64toh(_sb->fields.bitmap.age) + k_age_bump);
             RLOGW("Unclean shutdown while degraded with missing device! Dirty all of BITMAP")
             _dirty_bitmap->dirty_region(0, capacity());
         } else {
+            // Entering degraded from a previously-healthy (EITHER) state must advance the age, or the
+            // absent leg ties arbitration on reattach and the array opens healthy over stale data.
+            // Clean pull: +1 (same-epoch, bitmap-covered -> reattach resumes). Healthy-crash: the
+            // divergence was untracked, +k_age_bump so the reattached leg fully rebuilds.
+            if (static_cast< read_route >(_sb->fields.read_route) == read_route::EITHER)
+                _sb->fields.bitmap.age =
+                    htobe64(be64toh(_sb->fields.bitmap.age) + (_sb->fields.clean_unmount ? 1 : k_age_bump));
             _dirty_bitmap->load_from(*(a_is_missing ? _device_b : _device_a)->disk);
         }
     } else if (_device_a->new_device xor _device_b->new_device) {
@@ -252,14 +271,33 @@ void Raid1Disk::__init_bitmap_and_degraded_route() {
         RLOGW("Device is replacement {}, dirty all of BITMAP",
               *(_device_a->new_device ? _device_a->disk : _device_b->disk))
         _dirty_bitmap->dirty_region(0, capacity());
+        // Replacement rebuild: mode from the leg's contents (rebuild_mode above). An interrupted
+        // self-heal no longer lands here -- both superblocks are written now, so it reassembles
+        // through the degraded-return branches below.
+        _resync_mode = rebuild_mode((_device_a->new_device ? _device_a : _device_b)->sb_was_fresh, assume_clean);
         // Route reads to the existing (non-new) physical slot
         _read_route_cache.store(_device_a->new_device ? read_route::DEVB : read_route::DEVA, std::memory_order_release);
+    } else if (_device_a->new_device && _device_b->new_device) {
+        // Brand-new array. Without assume_clean the legs' unwritten contents cannot be assumed
+        // identical (recycled disks read old garbage), making EITHER-routed reads non-deterministic:
+        // pin device_a and blind-copy it over device_b once (md-style initial sync). assume_clean
+        // asserts both legs read zero -> already identical -> skip the initial sync.
+        if (!assume_clean) {
+            RLOGW("New array [uuid:{}]: initial sync of {} scheduled", _str_uuid, *_device_b->disk)
+            _dirty_bitmap->dirty_region(0, capacity());
+            _read_route_cache.store(read_route::DEVA, std::memory_order_release);
+            _resync_mode = resync_copy_mode::BLIND;
+        }
     } else if ((read_route::EITHER != _read_route_cache.load(std::memory_order_acquire)) &&
                (0 == _sb->fields.clean_unmount)) {
         // Bump the bitmap age
         _sb->fields.bitmap.age = htobe64(be64toh(_sb->fields.bitmap.age) + k_age_bump);
         RLOGW("Unclean shutdown in degraded mode! Dirty all of BITMAP")
         _dirty_bitmap->dirty_region(0, capacity());
+        // Unclean: the superbitmap is untrusted, so the dirty-all above spans the WHOLE, mostly-
+        // matching array -- CHECK skips the matches, whatever mode was persisted. (ZERO_TEST must not
+        // cross a crash: an untracked in-flight source-zeroing would leave a stale destination page.)
+        _resync_mode = resync_copy_mode::CHECK;
     } else if (auto const route = _read_route_cache.load(std::memory_order_acquire); read_route::EITHER != route) {
         auto const& active_dev = (route == read_route::DEVB) ? _device_b : _device_a;
         auto const& backup_dev = (route == read_route::DEVB) ? _device_a : _device_b;
@@ -269,10 +307,15 @@ void Raid1Disk::__init_bitmap_and_degraded_route() {
         if (!_dirty_bitmap->superbitmap_nonempty())
             RLOGW("Degraded + clean unmount + empty superbitmap [uuid:{}]", _str_uuid)
         _dirty_bitmap->load_from(*active_dev->disk);
+        // Clean degraded stop: I/O was quiesced, so the superbitmap is the exact remaining dirty set
+        // (load_from above) -- RESUME it in the persisted mode: BLIND for a known-divergent
+        // degradation (write-only is cheaper), CHECK for a mostly-matching self-heal, ZERO_TEST for a
+        // fresh-leg thin rebuild (not re-derivable once the leg has a superblock).
+        _resync_mode = static_cast< resync_copy_mode >(_sb->fields.bitmap.resync_mode);
     } else if (0 == _sb->fields.clean_unmount) {
-        // Both-present unclean: reads may diverge across legs. Pin to device_a (canonical),
-        // dirty all, mark device_b stale. __become_active skips device_b's SB (unavail guard)
-        // to preserve the >1 age gap for idempotent crash-mid-resync reassembly.
+        // Both-present unclean: legs may diverge only in the in-flight-at-crash regions. Pin reads
+        // to device_a (canonical), dirty all, mark device_b stale for routing. Both superblocks are
+        // written (ages equalize); an interrupted self-heal resumes via the degraded branches above.
         DEBUG_ASSERT(_read_route_cache.load(std::memory_order_relaxed) == read_route::EITHER,
                      "self-heal branch reached with non-EITHER route")
         // The XOR branch above catches exactly one-new-device; if both new_device flags are set
@@ -283,8 +326,10 @@ void Raid1Disk::__init_bitmap_and_degraded_route() {
         _dirty_bitmap->dirty_region(0, capacity());
         _read_route_cache.store(read_route::DEVA, std::memory_order_release);
         _device_b->unavail.test_and_set(std::memory_order_release);
+        // Mostly-matching data: compare and rewrite only the divergent pages.
+        _resync_mode = resync_copy_mode::CHECK;
         RLOGW("Unclean shutdown with both legs present [uuid:{}] -- reads pinned to {} (canonical), "
-              "full resync to {} scheduled to restore read-determinism",
+              "resync to {} scheduled to restore read-determinism",
               _str_uuid, *_device_a->disk, *_device_b->disk)
     }
     if (_raid_metrics) { // GCOVR_EXCL_BR_LINE
@@ -298,7 +343,7 @@ void Raid1Disk::__become_active() {
     auto const state = __capture_route_state();
     _sb->fields.clean_unmount = 0x0;
     _sb->fields.device_b = 0; // Reset this in case we loaded from dev_b
-    if (!write_superblock(*state.active_dev->disk, _sb.get(), read_route::DEVB == state.route, state.route)) {
+    if (!__write_sb(*state.active_dev->disk, read_route::DEVB == state.route, state.route)) {
         // If already degraded this is Fatal
         if (state.is_degraded) { throw std::runtime_error(fmt::format("Could not initialize superblocks!")); }
         if (!__become_degraded(true, &state, false)) {
@@ -307,17 +352,10 @@ void Raid1Disk::__become_active() {
         return;
     }
     if (state.backup_dev->disk->is_missing()) return;
-    // Preserve on-disk age gap for crash-mid-resync idempotency (see __init_bitmap_and_degraded_route).
-    if (state.backup_dev->unavail.test(std::memory_order_acquire)) {
-        // Both the SB write and its __become_degraded fallback are intentionally skipped: the array
-        // is already in the correct degraded state from __init_bitmap_and_degraded_route, and the
-        // stale SB must not be updated so the on-disk age gap is preserved. probe_mirror cannot
-        // clear unavail before this point because the resync task only starts after construction
-        // completes and the first queue thread registers.
-        RLOGW("Skipping backup SB write: device_b marked stale at startup [uuid:{}]", _str_uuid)
-        return;
-    }
-    if (!write_superblock(*state.backup_dev->disk, _sb.get(), read_route::DEVB != state.route, state.route)) {
+    // Write the backup SB too, even when it is the stale self-heal target: recovery keys on
+    // read_route + the persisted resync_mode, not an age divergence, so no gap is held open by
+    // skipping it. A genuinely-failed backup falls to the write-failure path below.
+    if (!__write_sb(*state.backup_dev->disk, read_route::DEVB != state.route, state.route)) {
         if (!__become_degraded(false, &state, false)) {
             throw std::runtime_error(fmt::format("Could not initialize superblocks!"));
         }
@@ -347,16 +385,13 @@ Raid1Disk::~Raid1Disk() {
     // Only update the superblock to clean devices. Pass include_superbitmap=true so the
     // on-disk superbitmap reflects the current dirty state. On next startup the call sites
     // for load_from check superbitmap_nonempty() and reject the volume if it is empty.
-    if (auto res =
-            write_superblock(*state.active_dev->disk, _sb.get(), read_route::DEVB == state.route, state.route, true);
-        !res) {
+    if (auto res = __write_sb(*state.active_dev->disk, read_route::DEVB == state.route, state.route, true); !res) {
         if (state.is_degraded) {
             RLOGE("Failed to clear clean bit...full sync required upon next assembly [uuid:{}]", _str_uuid)
         }
     }
     if (!state.is_degraded)
-        std::ignore =
-            write_superblock(*state.backup_dev->disk, _sb.get(), read_route::DEVB != state.route, state.route, true);
+        std::ignore = __write_sb(*state.backup_dev->disk, read_route::DEVB != state.route, state.route, true);
 }
 
 Raid1Disk::prepare_result Raid1Disk::prepare(ublksrv_queue const* q, int const iouring_device_start) {
@@ -371,6 +406,7 @@ Raid1Disk::prepare_result Raid1Disk::prepare(ublksrv_queue const* q, int const i
     result.max_sqes_per_io += b.max_sqes_per_io;
 
     // Enable resync only on the first real queue init (q != nullptr guards the probe-only call).
+    // toggle_resync reads the copy mode the constructor's degraded-init branches selected.
     if (q && _nr_hw_queues.fetch_add(1, std::memory_order_acq_rel) == 0) toggle_resync(true);
 
     return result;
@@ -413,7 +449,7 @@ bool Raid1Disk::__swap_device(std::string const& outgoing_device_id, std::shared
 
     // Write superblock to staying device first (critical path)
     auto& staying_dev = swapping_device_a ? _device_b : _device_a;
-    if (auto sync_res = write_superblock(*staying_dev->disk, _sb.get(), swapping_device_a, new_read_route); !sync_res) {
+    if (auto sync_res = __write_sb(*staying_dev->disk, swapping_device_a, new_read_route); !sync_res) {
         RLOGE("Could not advance Age [uuid:{}]: {}", _str_uuid, sync_res.error().message())
         // Rollback
         _sb->fields.bitmap.age = htobe64(old_age);
@@ -423,8 +459,8 @@ bool Raid1Disk::__swap_device(std::string const& outgoing_device_id, std::shared
     }
     // Commit SuperBlock to new device; if this fails it's not fatal per say...could work
     // later when we become clean; so let's be optimistic!
-    std::ignore = write_superblock(*outgoing_dev->disk, _sb.get(), !swapping_device_a,
-                                   _read_route_cache.load(std::memory_order_acquire));
+    std::ignore =
+        __write_sb(*outgoing_dev->disk, !swapping_device_a, _read_route_cache.load(std::memory_order_acquire));
 
     // Dirty entire bitmap if this is a new device
     if (outgoing_dev->new_device) _dirty_bitmap->dirty_region(0, capacity());
@@ -516,7 +552,7 @@ static inline std::shared_ptr< MirrorDevice > const& __route_to_device(RouteStat
 // Anytime we determine that a replacement disk is *new* we must dirty _every_
 // bit in the Bitmap and do a FULL resync.
 std::shared_ptr< ublk_disk > Raid1Disk::swap_device(std::string const& outgoing_device_id,
-                                                    std::shared_ptr< ublk_disk > incoming_device) {
+                                                    std::shared_ptr< ublk_disk > incoming_device, bool assume_clean) {
     if (!incoming_device->direct_io()) {
         RLOGW("Replacement device {} does not support O_DIRECT - RAID-1 will use buffered I/O (backend caching not "
               "bypassed!)",
@@ -580,11 +616,26 @@ std::shared_ptr< ublk_disk > Raid1Disk::swap_device(std::string const& outgoing_
         return incoming_device;
     }
 
+    // Capture the incoming leg's facts before __swap_device swaps the pointers (afterwards
+    // incoming_mirror holds the displaced device); they select the rebuild mode below.
+    bool const incoming_is_new = incoming_mirror->new_device;
+    bool const incoming_is_fresh = incoming_mirror->sb_was_fresh;
+
     // Atomically swap the device or fail; fail if swapping sole active device
-    if (__swap_device(outgoing_device_id, incoming_mirror, state.route)) {
+    bool const swapped = __swap_device(outgoing_device_id, incoming_mirror, state.route);
+    if (swapped) {
         if (_raid_metrics) _raid_metrics->record_device_swap(); // GCOVR_EXCL_BR_LINE
     }
 
+    // Publish the rebuild copy mode before relaunching (policy in rebuild_mode above), but ONLY on a
+    // real swap. A rejected swap (__swap_device's route CAS lost, or the staying-leg SB write failed
+    // and rolled back) leaves the array -- and its in-progress resync -- unchanged; clobbering the
+    // mode to BLIND here would turn a resumable CHECK/ZERO_TEST rebuild into a full copy, permanently
+    // provisioning a thin destination. A fresh incoming leg picks rebuild_mode; a within-age-1 re-add
+    // of a data-bearing leg blind-copies (BLIND is safe on any destination).
+    if (swapped)
+        _resync_mode.store(incoming_is_new ? rebuild_mode(incoming_is_fresh, assume_clean) : resync_copy_mode::BLIND,
+                           std::memory_order_release);
     // Now set back to IDLE state and kick a resync task off
     if (old_resync_flag) toggle_resync(true);
 
@@ -699,14 +750,11 @@ bool Raid1Disk::__become_clean() {
 
         // Bitmap is empty and route is EITHER — write clean superblocks under the lock so
         // the failure-path DEVA write (also under this lock) always serializes after them.
-        if (auto sync_res =
-                write_superblock(*state.active_dev->disk, _sb.get(), active_is_device_b, read_route::EITHER);
-            !sync_res) {
+        if (auto sync_res = __write_sb(*state.active_dev->disk, active_is_device_b, read_route::EITHER); !sync_res) {
             RLOGW("Could not become clean [uuid:{}]: {}", _str_uuid, sync_res.error().message())
         }
         if (!state.backup_dev->disk->is_missing()) {
-            if (auto sync_res =
-                    write_superblock(*state.backup_dev->disk, _sb.get(), !active_is_device_b, read_route::EITHER);
+            if (auto sync_res = __write_sb(*state.backup_dev->disk, !active_is_device_b, read_route::EITHER);
                 !sync_res) {
                 RLOGW("Could not become clean [uuid:{}]: {}", _str_uuid, sync_res.error().message())
             }
@@ -721,15 +769,12 @@ bool Raid1Disk::__become_clean() {
     auto const live_state = __capture_route_state();
     if (live_state.route != read_route::EITHER) {
         bool const live_active_is_b = (live_state.route == read_route::DEVB);
-        if (auto sync_res =
-                write_superblock(*live_state.active_dev->disk, _sb.get(), live_active_is_b, live_state.route);
-            !sync_res) {
+        if (auto sync_res = __write_sb(*live_state.active_dev->disk, live_active_is_b, live_state.route); !sync_res) {
             RLOGW("Could not re-write degraded superblock after race [uuid:{}]: {}", _str_uuid,
                   sync_res.error().message())
         }
         if (!live_state.backup_dev->disk->is_missing()) {
-            if (auto sync_res =
-                    write_superblock(*live_state.backup_dev->disk, _sb.get(), !live_active_is_b, live_state.route);
+            if (auto sync_res = __write_sb(*live_state.backup_dev->disk, !live_active_is_b, live_state.route);
                 !sync_res) {
                 RLOGW("Could not re-write degraded superblock after race [uuid:{}]: {}", _str_uuid,
                       sync_res.error().message())
@@ -737,6 +782,9 @@ bool Raid1Disk::__become_clean() {
         }
         return false; // caller loops to re-sync the dirty region
     }
+    // Clean (route EITHER): reset to BLIND so a fresh-leg ZERO_TEST cannot leak onto a later,
+    // now-populated resync of the same leg.
+    _resync_mode.store(resync_copy_mode::BLIND, std::memory_order_release);
     if (_raid_metrics) { // GCOVR_EXCL_BR_LINE
         // LCOV_EXCL_START
         _raid_metrics->record_degraded_state(false);
@@ -765,7 +813,7 @@ bool Raid1Disk::__try_persist_degraded_sb(bool spawn_resync) {
     // fail immediately, before it touches _sb. The _sb read below is therefore uncontested.
     auto const rs = __capture_route_state();
     bool const is_b = (rs.route == read_route::DEVB);
-    if (auto sb = write_superblock(*rs.active_dev->disk, _sb.get(), is_b, rs.route); sb) {
+    if (auto sb = __write_sb(*rs.active_dev->disk, is_b, rs.route); sb) {
         bool was_pending;
         {
             std::lock_guard lock(_ctrl_lock);
@@ -830,7 +878,7 @@ bool Raid1Disk::__become_degraded(bool failed_is_active, RouteState const* cur_s
         _raid_metrics->record_degraded_state(true);
     } // LCOV_EXCL_STOP
 
-    auto const sync_res = write_superblock(working_device, _sb.get(), backup_clean, new_route);
+    auto const sync_res = __write_sb(working_device, backup_clean, new_route);
     // A concurrent __try_persist_degraded_sb call may race write_superblock here; both writes
     // carry identical content (same _sb, route, age) so the interleaving is safe/idempotent.
     // Mirror the was_pending snapshot from __try_persist_degraded_sb: the winner's _ctrl_lock
@@ -919,6 +967,20 @@ bool Raid1Disk::__backup_writable(RouteState const& state, uint64_t addr, uint32
              (state.backup_dev->unavail.test(std::memory_order_acquire) || _dirty_bitmap->is_dirty(addr, len)));
 }
 
+void Raid1Disk::__dirty_region_untaint(uint64_t addr, uint32_t len) noexcept {
+    // A live re-dirty means the ZERO_TEST target may now hold written data here, so the zero-read
+    // assumption is void -- downgrade to CHECK (no-op unless currently ZERO_TEST; BLIND/CHECK stay).
+    // Store before dirtying so a concurrent resync observes CHECK when it re-processes the region.
+    // The mode store and the bitmap set are separate locations, so the resync's per-copy acquire load
+    // of _resync_mode is ordered against its observation of the dirty bit only on TSO/STLR targets
+    // (x86-64, arm64). The region_tracker Phase-2 post-check is the portable backstop: it keeps a
+    // region that raced an in-flight write dirty regardless, so a mis-ordered read cannot clear it.
+    auto expected = resync_copy_mode::ZERO_TEST;
+    _resync_mode.compare_exchange_strong(expected, resync_copy_mode::CHECK, std::memory_order_acq_rel,
+                                         std::memory_order_relaxed);
+    _dirty_bitmap->dirty_region(addr, len);
+}
+
 disk_task< int > Raid1Disk::async_iov(ublksrv_queue const* q, ublk_io_data const* data, iovec* iovecs, uint32_t nr_vecs,
                                       uint64_t addr) {
     auto const op = ublksrv_get_op(data->iod);
@@ -957,7 +1019,7 @@ disk_task< int > Raid1Disk::async_iov(ublksrv_queue const* q, ublk_io_data const
         // cannot pass while this region is in-flight.
         bool const become_degraded_ok = [&] {
             std::lock_guard lock(_clean_transition_mutex);
-            _dirty_bitmap->dirty_region(addr, len);
+            __dirty_region_untaint(addr, len);
             return __become_degraded(true, &state);
         }();
         // CAS lost and no backup to drain — nothing to await.
@@ -982,7 +1044,7 @@ disk_task< int > Raid1Disk::async_iov(ublksrv_queue const* q, ublk_io_data const
         // __become_clean's dirty_pages() gate cannot pass while this region is in-flight.
         bool const become_degraded_ok = [&] {
             std::lock_guard lock(_clean_transition_mutex);
-            _dirty_bitmap->dirty_region(addr, len);
+            __dirty_region_untaint(addr, len);
             return __become_degraded(false, &state);
         }();
         if (!become_degraded_ok) co_return -EAGAIN;
@@ -995,7 +1057,7 @@ disk_task< int > Raid1Disk::async_iov(ublksrv_queue const* q, ublk_io_data const
         // Site 3: backup write failed — dirty_region() is inside the mutex so
         // __become_clean's dirty_pages() gate cannot pass while this region is in-flight.
         std::lock_guard lock(_clean_transition_mutex);
-        _dirty_bitmap->dirty_region(addr, len);
+        __dirty_region_untaint(addr, len);
         if (auto d = __become_degraded(false, &state); !d) co_return -EAGAIN;
     } else if (state.backup_dev->unavail.test(std::memory_order_relaxed)) {
         RLOGI("Device {} back online (write succeeded) [uuid:{}]", *state.backup_dev->disk, _str_uuid)
@@ -1042,7 +1104,7 @@ io_result Raid1Disk::sync_iov(uint8_t op, iovec* iovecs, uint32_t nr_vecs, off_t
         // __become_clean's dirty_pages() gate cannot pass while this region is in-flight.
         bool const become_degraded_ok = [&] {
             std::lock_guard lock(_clean_transition_mutex);
-            _dirty_bitmap->dirty_region(static_cast< uint64_t >(addr), len);
+            __dirty_region_untaint(static_cast< uint64_t >(addr), len);
             return __become_degraded(true, &state);
         }();
         if (!become_degraded_ok)
@@ -1065,7 +1127,7 @@ io_result Raid1Disk::sync_iov(uint8_t op, iovec* iovecs, uint32_t nr_vecs, off_t
         // __become_clean's dirty_pages() gate cannot pass while this region is in-flight.
         bool const become_degraded_ok = [&] {
             std::lock_guard lock(_clean_transition_mutex);
-            _dirty_bitmap->dirty_region(static_cast< uint64_t >(addr), len);
+            __dirty_region_untaint(static_cast< uint64_t >(addr), len);
             return __become_degraded(false, &state);
         }();
         if (!become_degraded_ok)
@@ -1079,7 +1141,7 @@ io_result Raid1Disk::sync_iov(uint8_t op, iovec* iovecs, uint32_t nr_vecs, off_t
         // Site 3 (sync): backup write failed — dirty_region() is inside the mutex so
         // __become_clean's dirty_pages() gate cannot pass while this region is in-flight.
         std::lock_guard lock(_clean_transition_mutex);
-        _dirty_bitmap->dirty_region(static_cast< uint64_t >(addr), len);
+        __dirty_region_untaint(static_cast< uint64_t >(addr), len);
         if (auto d = __become_degraded(false, &state); !d)
             return std::unexpected(std::make_error_condition(std::errc::resource_unavailable_try_again));
     } else if (state.backup_dev->unavail.test(std::memory_order_relaxed)) {
@@ -1119,13 +1181,13 @@ inline Raid1Disk const* as_raid1(ublk_disk const& d) noexcept { return dynamic_c
 } // namespace
 
 std::shared_ptr< ublk_disk > swap_device(ublk_disk& disk, std::string const& old_device_id,
-                                         std::shared_ptr< ublk_disk > new_device) {
+                                         std::shared_ptr< ublk_disk > new_device, bool assume_clean) {
     auto* r1 = as_raid1(disk);
     if (!r1) {
         RLOGE("swap_device called on non-Raid1 disk: {}", *new_device);
         return new_device;
     }
-    return r1->swap_device(old_device_id, std::move(new_device));
+    return r1->swap_device(old_device_id, std::move(new_device), assume_clean);
 }
 
 array_state replica_states(ublk_disk const& disk) noexcept {
@@ -1149,8 +1211,9 @@ std::pair< std::shared_ptr< ublk_disk >, std::shared_ptr< ublk_disk > > replicas
 } // namespace raid1
 
 std::shared_ptr< ublk_disk > make_raid1_disk(boost::uuids::uuid const& uuid, std::shared_ptr< ublk_disk > dev_a,
-                                             std::shared_ptr< ublk_disk > dev_b, std::string const& parent_id) {
-    return std::make_shared< raid1::Raid1Disk >(uuid, std::move(dev_a), std::move(dev_b), parent_id);
+                                             std::shared_ptr< ublk_disk > dev_b, std::string const& parent_id,
+                                             bool assume_clean) {
+    return std::make_shared< raid1::Raid1Disk >(uuid, std::move(dev_a), std::move(dev_b), parent_id, assume_clean);
 }
 
 } // namespace ublkpp

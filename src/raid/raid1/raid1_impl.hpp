@@ -21,9 +21,12 @@ struct MirrorDevice {
     std::shared_ptr< ublk_disk > const disk;
     std::shared_ptr< SuperBlock > sb; // Only used during load_superblock time
     std::atomic_flag
-        unavail; // not ready for IO; also set at startup self-heal to prevent SB writes that would destroy the age gap
+        unavail; // not ready for IO; also set at startup self-heal to route away from the stale leg during resync
 
+    // new_device is also promoted on a >1 age gap, so it does NOT mean "reads zero". sb_was_fresh is
+    // the genuine no-superblock truth captured at load; only such a leg may rebuild via ZERO_TEST.
     bool new_device{true};
+    bool sb_was_fresh{true};
 };
 
 class Raid1Disk : public ublk_disk {
@@ -45,6 +48,12 @@ class Raid1Disk : public ublk_disk {
     std::shared_ptr< ublkpp::UblkRaidMetrics > _raid_metrics;
     // Active Re-Sync Task
     std::atomic< bool > _resync_enabled{true};
+
+    // Copy mode for the current/next resync, read by toggle_resync at every launch and persisted
+    // with every __write_sb, so a clean degraded restart resumes it (an unclean one forces CHECK;
+    // see __init_bitmap_and_degraded_route). Set by the degraded-init branches and swap_device;
+    // reset to BLIND when the array becomes clean. Read/written across queue/control/resync threads.
+    std::atomic< resync_copy_mode > _resync_mode{resync_copy_mode::BLIND};
     std::shared_ptr< Raid1ResyncTask > _resync_task;
 
     // Guards: (1) swap_device() - serializes concurrent callers on _device_a/_device_b mutations.
@@ -87,6 +96,14 @@ class Raid1Disk : public ublk_disk {
     // likewise. Used identically by both async_iov and sync_iov.
     bool __backup_writable(RouteState const& state, uint64_t addr, uint32_t len) const noexcept;
 
+    // Re-dirty a region during live I/O and, when a ZERO_TEST rebuild is in progress, taint the copy
+    // mode to CHECK first: the target leg may now hold written (non-zero) data here, so its
+    // read-zero-where-unallocated assumption no longer holds. Monotonic CAS (no-op unless ZERO_TEST;
+    // BLIND/CHECK are already safe on any destination). The mode store is sequenced before the bitmap
+    // set so a concurrent resync observes CHECK when it re-processes the region. Callers already hold
+    // _clean_transition_mutex around the dirty_region; the CAS is a standalone atomic op.
+    void __dirty_region_untaint(uint64_t addr, uint32_t len) noexcept;
+
     // Internal routines
     bool __become_clean();
     // Transitions in-memory route from EITHER→DEVA/DEVB and persists the superblock. Returns true
@@ -109,8 +126,14 @@ class Raid1Disk : public ublk_disk {
     void __load_and_select_superblock(boost::uuids::uuid const& uuid, std::shared_ptr< ublk_disk > dev_a,
                                       std::shared_ptr< ublk_disk > dev_b, std::string const& parent_id);
     void __init_params();
-    void __init_bitmap_and_degraded_route();
+    // assume_clean: caller asserts a fresh leg reads zero where unallocated (enables ZERO_TEST).
+    void __init_bitmap_and_degraded_route(bool assume_clean);
     void __become_active();
+    // Persist _sb (stamped with the live _resync_mode) to dev; every Raid1 SB write flows through here.
+    io_result __write_sb(ublk_disk& dev, bool device_b, read_route route, bool include_superbitmap = false) {
+        return write_superblock(dev, _sb.get(), device_b, route, include_superbitmap,
+                                _resync_mode.load(std::memory_order_acquire));
+    }
 
     // ☠️ ☠️ ☠️  DANGER: LOCK-FREE SYNCHRONIZATION - DO NOT MODIFY  ☠️ ☠️ ☠️
     //
@@ -150,14 +173,19 @@ class Raid1Disk : public ublk_disk {
 
 public:
     Raid1Disk(boost::uuids::uuid const& uuid, std::shared_ptr< ublk_disk > dev_a, std::shared_ptr< ublk_disk > dev_b,
-              std::string const& parent_id = "");
+              std::string const& parent_id = "", bool assume_clean = false);
     ~Raid1Disk() override;
 
     /// Raid1Disk API
     /// =============
-    std::shared_ptr< ublk_disk > swap_device(std::string const& old_device_id, std::shared_ptr< ublk_disk > new_device);
+    // assume_clean: caller asserts the incoming leg reads zero where unallocated (enables ZERO_TEST).
+    std::shared_ptr< ublk_disk > swap_device(std::string const& old_device_id, std::shared_ptr< ublk_disk > new_device,
+                                             bool assume_clean = false);
     raid1::array_state replica_states() const noexcept;
     uint64_t reserved_size() const noexcept { return _reserved_size; }
+    // Mode the next/current resync runs in; exposed for observability and mode-selection tests.
+    resync_copy_mode current_resync_mode() const noexcept { return _resync_mode.load(std::memory_order_acquire); }
+    // Launches (t) or stops the resync; launch reads _resync_mode, so store any new mode first.
     void toggle_resync(bool t);
     std::pair< std::shared_ptr< ublk_disk >, std::shared_ptr< ublk_disk > > replicas() const noexcept;
     /// =============

@@ -35,7 +35,11 @@ SISL_OPTION_GROUP(ublkpp_disk,
                    "craft_reference_tcp_srv per endpoint first)",
                    ::cxxopts::value< std::string >(), "<host:port,...>"),
                   (device_id, "", "device_id", "Recover existing device",
-                   cxxopts::value< int32_t >()->default_value("-1"), "<ublkid>"))
+                   cxxopts::value< int32_t >()->default_value("-1"), "<ublkid>"),
+                  (assume_clean, "", "assume_clean",
+                   "RAID1: assert a new leg reads zero where unallocated; its rebuild then skips "
+                   "all-zero regions (thin-preserving)",
+                   cxxopts::value< bool >()->default_value("false")->implicit_value("true"), ""))
 
 #define ENABLED_OPTIONS logging, ublkpp_tgt, raid1, ublkpp_disk
 
@@ -108,7 +112,8 @@ Result create_raid1(boost::uuids::uuid const& id, std::vector< std::string > con
         auto dev_a = get_driver(*layout.begin(), raid_uuid);
         auto dev_b = get_driver(*(layout.begin() + 1), raid_uuid);
 
-        dev = ublkpp::make_raid1_disk(id, std::move(dev_a), std::move(dev_b), raid_uuid);
+        auto const assume_clean = SISL_OPTIONS["assume_clean"].as< bool >();
+        dev = ublkpp::make_raid1_disk(id, std::move(dev_a), std::move(dev_b), raid_uuid, assume_clean);
     } catch (std::runtime_error const& e) {}
     if (!dev) return std::unexpected(std::make_error_condition(std::errc::operation_not_permitted));
     return _run_target(id, std::move(dev));
@@ -122,6 +127,7 @@ Result create_raid10(boost::uuids::uuid const& id, std::vector< std::string > co
 
     auto dev = std::shared_ptr< ublkpp::ublk_disk >();
     auto raid10_uuid_str = boost::uuids::to_string(id);
+    auto const assume_clean = SISL_OPTIONS["assume_clean"].as< bool >();
     try {
         auto devices = std::vector< std::shared_ptr< ublkpp::ublk_disk > >();
         auto name_gen = boost::uuids::name_generator(id);
@@ -136,8 +142,8 @@ Result create_raid10(boost::uuids::uuid const& id, std::vector< std::string > co
             auto dev_b = get_driver(layout[i + 1], partition_uuid_str);
 
             // Create RAID1 mirror and add to devices
-            devices.push_back(
-                ublkpp::make_raid1_disk(partition_uuid, std::move(dev_a), std::move(dev_b), raid10_uuid_str));
+            devices.push_back(ublkpp::make_raid1_disk(partition_uuid, std::move(dev_a), std::move(dev_b),
+                                                      raid10_uuid_str, assume_clean));
         }
 
         dev = ublkpp::make_raid0_disk(id, SISL_OPTIONS["stripe_size"].as< uint32_t >(), std::move(devices));
