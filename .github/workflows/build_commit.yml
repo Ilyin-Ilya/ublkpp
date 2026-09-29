@@ -37,25 +37,9 @@ jobs:
       tooling: None
     if: ${{ github.event_name != 'pull_request' }}
 
-  # craft_client (the extracted CRAFT wire + client + reference the craft_disk driver drives) sits between sisl
-  # and ublkpp: build its deps into the CraftClientDeps cache first, loading the sisl cache SislDeps stored.
-  # PR builds skip this and load the cache the push build stored.
-  CraftClientDeps:
-    needs: SislDeps
-    if: ${{ always() && (needs.SislDeps.result == 'success' || needs.SislDeps.result == 'skipped') && github.event_name != 'pull_request' }}
-    uses: szmyd/craft_client/.github/workflows/build_dependencies.yml@dev/v0.x
-    with:
-      branch: dev/v0.x
-      platform: ${{ inputs.platform }}
-      build-type: ${{ inputs.build-type }}
-      malloc-impl: ${{ inputs.malloc-impl }}
-      compiler: ${{ inputs.compiler }}
-      conan-channel: ${{ inputs.conan-channel }}
-      tooling: None
-
   UblkPPDeps:
-    needs: [SislDeps, CraftClientDeps]
-    if: ${{ always() && (needs.SislDeps.result == 'success' || needs.SislDeps.result == 'skipped') && (needs.CraftClientDeps.result == 'success' || needs.CraftClientDeps.result == 'skipped') }}
+    needs: SislDeps
+    if: ${{ always() && (needs.SislDeps.result == 'success' || needs.SislDeps.result == 'skipped') }}
     uses: ./.github/workflows/build_dependencies.yml
     with:
       branch: ${{ github.ref }}

@@ -158,15 +158,6 @@ jobs:
         fail_on_cache_miss: false
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
 
-    - name: Load CraftClient Cache
-      uses: eBay/sisl/.github/actions/load_conan2@dev/v14.x
-      with:
-        testing: 'False'
-        path: import/craft_client
-        key_prefix: CraftClientDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}
-        fail_on_cache_miss: false
-      if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
-
     - name: Retrieve Dependencies
       uses: actions/checkout@v4
       with:
@@ -175,21 +166,10 @@ jobs:
         ref: dev/v14.x
       if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
 
-    - name: Retrieve CraftClient
-      uses: actions/checkout@v4
-      with:
-        repository: szmyd/craft_client
-        path: import/craft_client
-        ref: dev/v0.x
-      if: ${{ inputs.testing == 'True' || steps.restore-cache.outputs.cache-hit != 'true' }}
-
     - name: Prepare Recipes
       run: |
         pushd import/sisl
         ./prepare_v2.sh
-        conan export --user oss --channel ${{ inputs.conan-channel }} .
-        popd
-        pushd import/craft_client
         conan export --user oss --channel ${{ inputs.conan-channel }} .
         popd
         ./prepare_v2.sh
@@ -241,7 +221,6 @@ jobs:
     - name: Upload coverage reports to Codecov
       uses: codecov/codecov-action@v5
       with:
-        token: ${{ secrets.CODECOV_TOKEN }}
         files: ./coverage.xml
         disable_search: true
       if: ${{ inputs.tooling == 'Coverage' }}
